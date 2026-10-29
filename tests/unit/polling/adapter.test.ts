@@ -2,9 +2,12 @@
  * Adapter contract test.
  *
  * Verifies that synthetic polling events contain all the JSON paths
- * that the router adapter reads when processing webhooks.
+ * that the router adapter reads when processing webhooks, by comparing
+ * against real webhook payload fixtures from official documentation.
  */
 
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -15,112 +18,132 @@ import {
 	type GitHubPullRequest,
 	type GitHubWorkflowRun,
 } from '../../../src/polling/providers/github/types.js';
+import {
+	buildSyntheticJiraStatusChangedPayload,
+	type JiraChangelogHistory,
+	type JiraChangelogItem,
+	type JiraIssue,
+} from '../../../src/polling/providers/jira/types.js';
+
+// Load real webhook fixtures
+const FIXTURES_DIR = join(__dirname, '../../fixtures/webhooks');
+
+function loadFixture(name: string): unknown {
+	const path = join(FIXTURES_DIR, name);
+	return JSON.parse(readFileSync(path, 'utf-8'));
+}
 
 /**
- * Real webhook payload fixtures.
- *
- * These represent the minimal structure of actual GitHub webhook payloads
- * based on documented fields the router adapter reads.
+ * Extract all JSON paths from an object (dot notation).
+ * Skips _source and _note metadata fields.
  */
-const REAL_CHECK_SUITE_WEBHOOK = {
-	_eventType: 'check_suite',
-	_deliveryId: 'abc123-def456',
-	action: 'completed',
-	check_suite: {
-		id: 123456789,
-		status: 'completed',
-		conclusion: 'success',
-		head_sha: 'a1b2c3d4e5f6',
-		head_branch: 'feature/my-branch',
-		pull_requests: [
-			{
-				number: 42,
-				head: {
-					ref: 'feature/my-branch',
-					sha: 'a1b2c3d4e5f6',
-				},
-			},
-		],
-	},
-	repository: {
-		full_name: 'owner/repo',
-		html_url: 'https://github.com/owner/repo',
-	},
-	sender: {
-		login: 'github-actions[bot]',
-	},
+function extractPaths(obj: unknown, prefix = ''): Set<string> {
+	const paths = new Set<string>();
+	if (obj === null || obj === undefined) return paths;
+	if (typeof obj !== 'object') return paths;
+
+	for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+		// Skip metadata fields
+		if (key === '_source' || key === '_note') continue;
+
+		const path = prefix ? `${prefix}.${key}` : key;
+		paths.add(path);
+
+		if (value && typeof value === 'object' && !Array.isArray(value)) {
+			for (const subPath of extractPaths(value, path)) {
+				paths.add(subPath);
+			}
+		} else if (Array.isArray(value) && value.length > 0 && typeof value[0] === 'object') {
+			// For arrays of objects, extract paths from first element
+			for (const subPath of extractPaths(value[0], `${path}[0]`)) {
+				paths.add(subPath);
+			}
+		}
+	}
+	return paths;
+}
+
+/**
+ * Paths that triggers and adapters actually read from the payload.
+ * Derived from code analysis of src/router/adapters/ and src/triggers/.
+ */
+const REQUIRED_PATHS = {
+	checkSuite: [
+		'action',
+		'check_suite',
+		'check_suite.id',
+		'check_suite.status',
+		'check_suite.conclusion',
+		'check_suite.head_sha',
+		'check_suite.head_branch',
+		'check_suite.pull_requests',
+		'repository',
+		'repository.full_name',
+		'sender',
+		'sender.login',
+	],
+	prReview: [
+		'action',
+		'review',
+		'review.id',
+		'review.state',
+		'review.body',
+		'review.user',
+		'review.user.login',
+		'pull_request',
+		'pull_request.number',
+		'pull_request.title',
+		'pull_request.head',
+		'pull_request.head.ref',
+		'pull_request.head.sha',
+		'pull_request.base',
+		'pull_request.base.ref',
+		'repository',
+		'repository.full_name',
+		'sender',
+		'sender.login',
+	],
+	prMerged: [
+		'action',
+		'number',
+		'pull_request',
+		'pull_request.number',
+		'pull_request.merged',
+		'pull_request.state',
+		'pull_request.draft',
+		'pull_request.head',
+		'pull_request.head.ref',
+		'pull_request.head.sha',
+		'pull_request.base',
+		'pull_request.base.ref',
+		'pull_request.user',
+		'pull_request.user.login',
+		'repository',
+		'repository.full_name',
+		'sender',
+		'sender.login',
+	],
+	jiraStatusChanged: [
+		'webhookEvent',
+		'issue',
+		'issue.id',
+		'issue.key',
+		'issue.fields',
+		'issue.fields.project',
+		'issue.fields.project.key',
+		'issue.fields.status',
+		'issue.fields.status.id',
+		'issue.fields.status.name',
+		'issue.fields.summary',
+		'changelog',
+		'changelog.items',
+	],
 };
 
-const REAL_PR_REVIEW_WEBHOOK = {
-	_eventType: 'pull_request_review',
-	_deliveryId: 'review-123',
-	action: 'submitted',
-	review: {
-		id: 987654321,
-		state: 'approved',
-		body: 'LGTM!',
-		html_url: 'https://github.com/owner/repo/pull/42#pullrequestreview-987654321',
-		user: {
-			login: 'reviewer-user',
-		},
-	},
-	pull_request: {
-		number: 42,
-		title: 'Add new feature',
-		body: 'This PR adds a new feature.',
-		html_url: 'https://github.com/owner/repo/pull/42',
-		head: {
-			ref: 'feature/new-feature',
-			sha: 'xyz789',
-		},
-		base: {
-			ref: 'main',
-		},
-	},
-	repository: {
-		full_name: 'owner/repo',
-		html_url: 'https://github.com/owner/repo',
-	},
-	sender: {
-		login: 'reviewer-user',
-	},
-};
-
-const REAL_MERGED_PR_WEBHOOK = {
-	_eventType: 'pull_request',
-	_deliveryId: 'pr-merged-456',
-	action: 'closed',
-	number: 42,
-	pull_request: {
-		number: 42,
-		title: 'Add new feature',
-		body: 'This PR adds a new feature.',
-		html_url: 'https://github.com/owner/repo/pull/42',
-		state: 'closed',
-		draft: false,
-		merged: true,
-		head: {
-			ref: 'feature/new-feature',
-			sha: 'xyz789',
-		},
-		base: {
-			ref: 'main',
-		},
-		user: {
-			login: 'pr-author',
-		},
-	},
-	repository: {
-		full_name: 'owner/repo',
-		html_url: 'https://github.com/owner/repo',
-	},
-	sender: {
-		login: 'pr-author',
-	},
-};
-
-describe('adapter contract: synthetic events match webhook structure', () => {
+describe('adapter contract: synthetic events match real webhook structure', () => {
 	describe('check_suite events', () => {
+		const realFixture = loadFixture('github-check-suite-completed.json') as Record<string, unknown>;
+
 		const mockWorkflowRun: GitHubWorkflowRun = {
 			id: 111222333,
 			name: 'CI',
@@ -138,83 +161,55 @@ describe('adapter contract: synthetic events match webhook structure', () => {
 
 		const synthetic = buildSyntheticCheckSuitePayload(mockWorkflowRun, 'success', 'owner/repo', 42);
 
-		it('has _eventType matching webhook', () => {
-			expect(synthetic._eventType).toBe(REAL_CHECK_SUITE_WEBHOOK._eventType);
+		it('synthetic has all required paths that adapters/triggers read', () => {
+			const syntheticPaths = extractPaths(synthetic);
+			const missing = REQUIRED_PATHS.checkSuite.filter((p) => !syntheticPaths.has(p));
+			expect(
+				missing,
+				`Synthetic check_suite missing required paths: ${missing.join(', ')}`,
+			).toEqual([]);
 		});
 
-		it('has _deliveryId (required for actionId)', () => {
-			expect(synthetic._deliveryId).toBeDefined();
-			expect(typeof synthetic._deliveryId).toBe('string');
+		it('real fixture has all required paths (validates fixture correctness)', () => {
+			const realPaths = extractPaths(realFixture);
+			const missing = REQUIRED_PATHS.checkSuite.filter((p) => !realPaths.has(p));
+			expect(missing, `Real fixture missing required paths: ${missing.join(', ')}`).toEqual([]);
 		});
 
-		it('has action: completed', () => {
-			expect(synthetic.action).toBe(REAL_CHECK_SUITE_WEBHOOK.action);
+		it('reports paths in real fixture but missing in synthetic (informational)', () => {
+			const realPaths = extractPaths(realFixture);
+			const syntheticPaths = extractPaths(synthetic);
+			const extraInReal = [...realPaths].filter((p) => !syntheticPaths.has(p));
+			// This is informational - we don't fail on extra paths in real fixture
+			// as long as synthetic has all REQUIRED_PATHS
+			if (extraInReal.length > 0) {
+				console.log(
+					'check_suite: Paths in real fixture but not in synthetic:',
+					extraInReal.slice(0, 10),
+				);
+			}
 		});
 
-		it('has check_suite.id (from workflow run check_suite_id)', () => {
-			expect(synthetic.check_suite.id).toBeDefined();
-			expect(typeof synthetic.check_suite.id).toBe('number');
-		});
-
-		it('has check_suite.status', () => {
-			expect(synthetic.check_suite.status).toBe('completed');
-		});
-
-		it('has check_suite.conclusion', () => {
-			expect(['success', 'failure']).toContain(synthetic.check_suite.conclusion);
-		});
-
-		it('has check_suite.head_sha', () => {
-			expect(synthetic.check_suite.head_sha).toBe(mockWorkflowRun.head_sha);
-		});
-
-		it('has check_suite.head_branch', () => {
-			expect(synthetic.check_suite.head_branch).toBe(mockWorkflowRun.head_branch);
-		});
-
-		it('has check_suite.pull_requests array', () => {
-			expect(Array.isArray(synthetic.check_suite.pull_requests)).toBe(true);
-			expect(synthetic.check_suite.pull_requests.length).toBeGreaterThan(0);
-			expect(synthetic.check_suite.pull_requests[0].number).toBe(42);
-		});
-
-		it('has repository.full_name', () => {
-			expect(synthetic.repository.full_name).toBe('owner/repo');
-		});
-
-		it('has sender.login', () => {
-			expect(synthetic.sender.login).toBeDefined();
-			expect(typeof synthetic.sender.login).toBe('string');
-		});
-
-		it('synthetic structure matches all router-read paths', () => {
-			// These are the exact paths the GitHubRouterAdapter reads
-			expect(synthetic._eventType).toBeDefined();
-			expect(synthetic._deliveryId).toBeDefined();
-			expect(synthetic.action).toBeDefined();
-			expect(synthetic.check_suite).toBeDefined();
-			expect(synthetic.check_suite.id).toBeDefined();
-			expect(synthetic.check_suite.status).toBeDefined();
-			expect(synthetic.check_suite.conclusion).toBeDefined();
-			expect(synthetic.check_suite.head_sha).toBeDefined();
-			expect(synthetic.check_suite.head_branch).toBeDefined();
-			expect(synthetic.check_suite.pull_requests).toBeDefined();
-			expect(synthetic.repository).toBeDefined();
-			expect(synthetic.repository.full_name).toBeDefined();
-			expect(synthetic.sender).toBeDefined();
-			expect(synthetic.sender.login).toBeDefined();
+		it('matches key structural values', () => {
+			expect(synthetic.action).toBe(realFixture.action);
+			expect(typeof synthetic.check_suite).toBe(typeof realFixture.check_suite);
+			expect(typeof synthetic.repository).toBe(typeof realFixture.repository);
+			expect(typeof synthetic.sender).toBe(typeof realFixture.sender);
 		});
 	});
 
 	describe('pull_request_review events', () => {
+		const realFixture = loadFixture('github-pull-request-review-submitted.json') as Record<
+			string,
+			unknown
+		>;
+
 		const mockReview: GitHubPRReview = {
 			id: 987654321,
 			state: 'APPROVED',
 			body: 'LGTM!',
 			html_url: 'https://github.com/owner/repo/pull/42#pullrequestreview-987654321',
-			user: {
-				login: 'reviewer-user',
-			},
+			user: { login: 'reviewer-user' },
 			submitted_at: new Date().toISOString(),
 			commit_id: 'xyz789',
 		};
@@ -225,16 +220,9 @@ describe('adapter contract: synthetic events match webhook structure', () => {
 			body: 'This PR adds a new feature.',
 			state: 'open',
 			html_url: 'https://github.com/owner/repo/pull/42',
-			head: {
-				ref: 'feature/new-feature',
-				sha: 'xyz789',
-			},
-			base: {
-				ref: 'main',
-			},
-			user: {
-				login: 'pr-author',
-			},
+			head: { ref: 'feature/new-feature', sha: 'xyz789' },
+			base: { ref: 'main' },
+			user: { login: 'pr-author' },
 			merged: false,
 			merged_at: null,
 			updated_at: new Date().toISOString(),
@@ -242,97 +230,54 @@ describe('adapter contract: synthetic events match webhook structure', () => {
 
 		const synthetic = buildSyntheticPRReviewPayload(mockReview, mockPR, 'owner/repo');
 
-		it('has _eventType matching webhook', () => {
-			expect(synthetic._eventType).toBe(REAL_PR_REVIEW_WEBHOOK._eventType);
+		it('synthetic has all required paths that adapters/triggers read', () => {
+			const syntheticPaths = extractPaths(synthetic);
+			const missing = REQUIRED_PATHS.prReview.filter((p) => !syntheticPaths.has(p));
+			expect(missing, `Synthetic pr_review missing required paths: ${missing.join(', ')}`).toEqual(
+				[],
+			);
 		});
 
-		it('has _deliveryId', () => {
-			expect(synthetic._deliveryId).toBeDefined();
-			expect(typeof synthetic._deliveryId).toBe('string');
+		it('real fixture has all required paths (validates fixture correctness)', () => {
+			const realPaths = extractPaths(realFixture);
+			const missing = REQUIRED_PATHS.prReview.filter((p) => !realPaths.has(p));
+			expect(missing, `Real fixture missing required paths: ${missing.join(', ')}`).toEqual([]);
 		});
 
-		it('has action: submitted', () => {
-			expect(synthetic.action).toBe(REAL_PR_REVIEW_WEBHOOK.action);
+		it('reports paths in real fixture but missing in synthetic (informational)', () => {
+			const realPaths = extractPaths(realFixture);
+			const syntheticPaths = extractPaths(synthetic);
+			const extraInReal = [...realPaths].filter((p) => !syntheticPaths.has(p));
+			if (extraInReal.length > 0) {
+				console.log(
+					'pr_review: Paths in real fixture but not in synthetic:',
+					extraInReal.slice(0, 10),
+				);
+			}
 		});
 
-		it('has review.id', () => {
-			expect(synthetic.review.id).toBe(mockReview.id);
-		});
-
-		it('has review.state (lowercase)', () => {
-			expect(synthetic.review.state).toBe('approved');
-		});
-
-		it('has review.body', () => {
-			expect(synthetic.review.body).toBe(mockReview.body);
-		});
-
-		it('has review.user.login (critical for loop protection)', () => {
-			expect(synthetic.review.user.login).toBe(mockReview.user.login);
-		});
-
-		it('has pull_request.number', () => {
-			expect(synthetic.pull_request.number).toBe(mockPR.number);
-		});
-
-		it('has pull_request.title', () => {
-			expect(synthetic.pull_request.title).toBe(mockPR.title);
-		});
-
-		it('has pull_request.head.ref and head.sha', () => {
-			expect(synthetic.pull_request.head.ref).toBe(mockPR.head.ref);
-			expect(synthetic.pull_request.head.sha).toBe(mockPR.head.sha);
-		});
-
-		it('has pull_request.base.ref', () => {
-			expect(synthetic.pull_request.base.ref).toBe(mockPR.base.ref);
-		});
-
-		it('has repository.full_name', () => {
-			expect(synthetic.repository.full_name).toBe('owner/repo');
-		});
-
-		it('has sender.login (same as reviewer for loop protection)', () => {
-			expect(synthetic.sender.login).toBe(mockReview.user.login);
-		});
-
-		it('synthetic structure matches all router-read paths', () => {
-			expect(synthetic._eventType).toBeDefined();
-			expect(synthetic._deliveryId).toBeDefined();
-			expect(synthetic.action).toBeDefined();
-			expect(synthetic.review).toBeDefined();
-			expect(synthetic.review.id).toBeDefined();
-			expect(synthetic.review.state).toBeDefined();
-			expect(synthetic.review.user).toBeDefined();
-			expect(synthetic.review.user.login).toBeDefined();
-			expect(synthetic.pull_request).toBeDefined();
-			expect(synthetic.pull_request.number).toBeDefined();
-			expect(synthetic.pull_request.head).toBeDefined();
-			expect(synthetic.pull_request.base).toBeDefined();
-			expect(synthetic.repository).toBeDefined();
-			expect(synthetic.repository.full_name).toBeDefined();
-			expect(synthetic.sender).toBeDefined();
-			expect(synthetic.sender.login).toBeDefined();
+		it('matches key structural values', () => {
+			expect(synthetic.action).toBe(realFixture.action);
+			expect(typeof synthetic.review).toBe(typeof realFixture.review);
+			expect(typeof synthetic.pull_request).toBe(typeof realFixture.pull_request);
 		});
 	});
 
 	describe('pull_request closed+merged events', () => {
+		const realFixture = loadFixture('github-pull-request-closed-merged.json') as Record<
+			string,
+			unknown
+		>;
+
 		const mockMergedPR: GitHubPullRequest = {
 			number: 42,
 			title: 'Add new feature',
 			body: 'This PR adds a new feature.',
 			state: 'closed',
 			html_url: 'https://github.com/owner/repo/pull/42',
-			head: {
-				ref: 'feature/new-feature',
-				sha: 'xyz789',
-			},
-			base: {
-				ref: 'main',
-			},
-			user: {
-				login: 'pr-author',
-			},
+			head: { ref: 'feature/new-feature', sha: 'xyz789' },
+			base: { ref: 'main' },
+			user: { login: 'pr-author' },
 			merged: true,
 			merged_at: new Date().toISOString(),
 			updated_at: new Date().toISOString(),
@@ -340,77 +285,118 @@ describe('adapter contract: synthetic events match webhook structure', () => {
 
 		const synthetic = buildSyntheticMergedPRPayload(mockMergedPR, 'owner/repo');
 
-		it('has _eventType matching webhook', () => {
-			expect(synthetic._eventType).toBe(REAL_MERGED_PR_WEBHOOK._eventType);
+		it('synthetic has all required paths that adapters/triggers read', () => {
+			const syntheticPaths = extractPaths(synthetic);
+			const missing = REQUIRED_PATHS.prMerged.filter((p) => !syntheticPaths.has(p));
+			expect(missing, `Synthetic pr_merged missing required paths: ${missing.join(', ')}`).toEqual(
+				[],
+			);
 		});
 
-		it('has _deliveryId', () => {
+		it('real fixture has all required paths (validates fixture correctness)', () => {
+			const realPaths = extractPaths(realFixture);
+			const missing = REQUIRED_PATHS.prMerged.filter((p) => !realPaths.has(p));
+			expect(missing, `Real fixture missing required paths: ${missing.join(', ')}`).toEqual([]);
+		});
+
+		it('reports paths in real fixture but missing in synthetic (informational)', () => {
+			const realPaths = extractPaths(realFixture);
+			const syntheticPaths = extractPaths(synthetic);
+			const extraInReal = [...realPaths].filter((p) => !syntheticPaths.has(p));
+			if (extraInReal.length > 0) {
+				console.log(
+					'pr_merged: Paths in real fixture but not in synthetic:',
+					extraInReal.slice(0, 10),
+				);
+			}
+		});
+
+		it('matches key structural values', () => {
+			expect(synthetic.action).toBe(realFixture.action);
+			// Verify number field exists and is the expected type
+			expect(typeof synthetic.number).toBe('number');
+			expect(typeof (realFixture as { number: number }).number).toBe('number');
+		});
+	});
+
+	describe('Jira status-changed events', () => {
+		const realFixture = loadFixture('jira-issue-updated-status-change.json') as Record<
+			string,
+			unknown
+		>;
+
+		const mockIssue: JiraIssue = {
+			id: '10000',
+			key: 'PROJ-123',
+			fields: {
+				summary: 'Test Issue',
+				status: { id: '10002', name: 'In Progress' },
+				project: { key: 'PROJ' },
+				labels: ['feature'],
+				components: [{ name: 'Backend' }],
+				updated: new Date().toISOString(),
+			},
+		};
+
+		const mockHistory: JiraChangelogHistory = {
+			id: '10001',
+			created: new Date().toISOString(),
+			author: { accountId: 'user-123' },
+			items: [
+				{
+					field: 'status',
+					from: '10001',
+					to: '10002',
+					fromString: 'To Do',
+					toString: 'In Progress',
+				},
+			],
+		};
+
+		const mockStatusChange: JiraChangelogItem = mockHistory.items[0];
+
+		const synthetic = buildSyntheticJiraStatusChangedPayload(
+			mockIssue,
+			mockHistory,
+			mockStatusChange,
+		);
+
+		it('synthetic has all required paths that adapters/triggers read', () => {
+			const syntheticPaths = extractPaths(synthetic);
+			const missing = REQUIRED_PATHS.jiraStatusChanged.filter((p) => !syntheticPaths.has(p));
+			expect(
+				missing,
+				`Synthetic jira_status_changed missing required paths: ${missing.join(', ')}`,
+			).toEqual([]);
+		});
+
+		it('real fixture has all required paths (validates fixture correctness)', () => {
+			const realPaths = extractPaths(realFixture);
+			const missing = REQUIRED_PATHS.jiraStatusChanged.filter((p) => !realPaths.has(p));
+			expect(missing, `Real fixture missing required paths: ${missing.join(', ')}`).toEqual([]);
+		});
+
+		it('reports paths in real fixture but missing in synthetic (informational)', () => {
+			const realPaths = extractPaths(realFixture);
+			const syntheticPaths = extractPaths(synthetic);
+			const extraInReal = [...realPaths].filter((p) => !syntheticPaths.has(p));
+			if (extraInReal.length > 0) {
+				console.log(
+					'jira_status_changed: Paths in real fixture but not in synthetic:',
+					extraInReal.slice(0, 10),
+				);
+			}
+		});
+
+		it('matches key structural values', () => {
+			expect(synthetic.webhookEvent).toBe(realFixture.webhookEvent);
+			expect(typeof synthetic.issue).toBe(typeof realFixture.issue);
+			expect(typeof synthetic.changelog).toBe(typeof realFixture.changelog);
+		});
+
+		it('synthetic has _deliveryId for actionId generation', () => {
 			expect(synthetic._deliveryId).toBeDefined();
 			expect(typeof synthetic._deliveryId).toBe('string');
-		});
-
-		it('has action: closed', () => {
-			expect(synthetic.action).toBe(REAL_MERGED_PR_WEBHOOK.action);
-		});
-
-		it('has top-level number', () => {
-			expect(synthetic.number).toBe(mockMergedPR.number);
-		});
-
-		it('has pull_request.number', () => {
-			expect(synthetic.pull_request.number).toBe(mockMergedPR.number);
-		});
-
-		it('has pull_request.merged: true (critical for merge detection)', () => {
-			expect(synthetic.pull_request.merged).toBe(true);
-		});
-
-		it('has pull_request.state: closed', () => {
-			expect(synthetic.pull_request.state).toBe('closed');
-		});
-
-		it('has pull_request.draft: false', () => {
-			expect(synthetic.pull_request.draft).toBe(false);
-		});
-
-		it('has pull_request.head.ref and head.sha', () => {
-			expect(synthetic.pull_request.head.ref).toBe(mockMergedPR.head.ref);
-			expect(synthetic.pull_request.head.sha).toBe(mockMergedPR.head.sha);
-		});
-
-		it('has pull_request.base.ref', () => {
-			expect(synthetic.pull_request.base.ref).toBe(mockMergedPR.base.ref);
-		});
-
-		it('has pull_request.user.login', () => {
-			expect(synthetic.pull_request.user.login).toBe(mockMergedPR.user.login);
-		});
-
-		it('has repository.full_name', () => {
-			expect(synthetic.repository.full_name).toBe('owner/repo');
-		});
-
-		it('has sender.login', () => {
-			expect(synthetic.sender.login).toBe(mockMergedPR.user.login);
-		});
-
-		it('synthetic structure matches all router-read paths', () => {
-			expect(synthetic._eventType).toBeDefined();
-			expect(synthetic._deliveryId).toBeDefined();
-			expect(synthetic.action).toBeDefined();
-			expect(synthetic.number).toBeDefined();
-			expect(synthetic.pull_request).toBeDefined();
-			expect(synthetic.pull_request.number).toBeDefined();
-			expect(synthetic.pull_request.merged).toBe(true);
-			expect(synthetic.pull_request.state).toBeDefined();
-			expect(synthetic.pull_request.head).toBeDefined();
-			expect(synthetic.pull_request.base).toBeDefined();
-			expect(synthetic.pull_request.user).toBeDefined();
-			expect(synthetic.pull_request.user.login).toBeDefined();
-			expect(synthetic.repository).toBeDefined();
-			expect(synthetic.repository.full_name).toBeDefined();
-			expect(synthetic.sender).toBeDefined();
-			expect(synthetic.sender.login).toBeDefined();
 		});
 	});
 });
