@@ -36,15 +36,28 @@ vi.mock('bullmq', () => ({
 	})),
 }));
 
-// Mock project loading
+// Mock project loading and router config
 const mockLoadProjectConfig = vi.fn().mockResolvedValue({ fullProjects: [] });
 vi.mock('../../../src/router/config.js', () => ({
 	loadProjectConfig: () => mockLoadProjectConfig(),
+	routerConfig: {
+		redisUrl: 'redis://localhost:6379',
+	},
 }));
 
 // Mock GitHub token retrieval
 vi.mock('../../../src/config/projects.js', () => ({
 	getProjectGitHubToken: vi.fn().mockRejectedValue(new Error('No token')),
+}));
+
+// Mock Jira bot identity resolver
+vi.mock('../../../src/router/bot-identity-resolvers.js', () => ({
+	resolveJiraBotAccountId: vi.fn().mockResolvedValue(null),
+}));
+
+// Mock Jira credentials resolver
+vi.mock('../../../src/router/platformClients/index.js', () => ({
+	resolveJiraCredentials: vi.fn().mockResolvedValue(null),
 }));
 
 // Mock trigger registry
@@ -75,6 +88,10 @@ vi.mock('../../../src/polling/providers/github/merged-pr-poller.js', () => ({
 
 vi.mock('../../../src/polling/cold-start.js', () => ({
 	handleGitHubRepoColdStart: vi.fn().mockResolvedValue({ seeded: 0, skipped: 0 }),
+}));
+
+vi.mock('../../../src/polling/providers/jira/index.js', () => ({
+	pollJiraStatusChanges: vi.fn().mockResolvedValue({ emitted: 0, errors: 0, total: 0, skipped: 0 }),
 }));
 
 vi.mock('../../../src/polling/adapter.js', () => ({

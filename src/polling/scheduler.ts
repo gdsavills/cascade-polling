@@ -8,7 +8,9 @@
 import { Octokit } from '@octokit/rest';
 import { type ConnectionOptions, Queue, Worker } from 'bullmq';
 import { getProjectGitHubToken } from '../config/projects.js';
+import { resolveJiraBotAccountId } from '../router/bot-identity-resolvers.js';
 import { loadProjectConfig } from '../router/config.js';
+import { resolveJiraCredentials } from '../router/platformClients/index.js';
 import { captureException } from '../sentry.js';
 import { registerBuiltInTriggers } from '../triggers/builtins.js';
 import { createTriggerRegistry, type TriggerRegistry } from '../triggers/registry.js';
@@ -21,6 +23,11 @@ import { pollingConfig } from './config.js';
 import { pollCheckSuitesForRepo } from './providers/github/check-suite-poller.js';
 import { pollMergedPRsForRepo } from './providers/github/merged-pr-poller.js';
 import { pollPRReviewsForRepo } from './providers/github/pr-review-poller.js';
+import {
+	type JiraApiClient,
+	type JiraSearchResponse,
+	pollJiraStatusChanges,
+} from './providers/jira/index.js';
 
 const QUEUE_NAME = 'polling:scheduler';
 const JOB_NAME = 'poll-cycle';
@@ -139,24 +146,44 @@ async function runPollCycle(triggerRegistry: TriggerRegistry): Promise<void> {
 		return;
 	}
 
-	const adapter = getPollingAdapter('github');
+	const githubAdapter = getPollingAdapter('github');
+	const jiraAdapter = getPollingAdapter('jira');
 	let totalEmitted = 0;
 	let totalErrors = 0;
 
 	for (const project of fullProjects) {
+		// Poll GitHub
 		try {
-			const stats = await pollProject(project, adapter, triggerRegistry);
+			const stats = await pollGitHubProject(project, githubAdapter, triggerRegistry);
 			totalEmitted += stats.emitted;
 			totalErrors += stats.errors;
 		} catch (error) {
 			totalErrors++;
-			logger.error('Failed to poll project', {
+			logger.error('Failed to poll GitHub for project', {
 				projectId: project.id,
 				error: String(error),
 			});
 			captureException(error instanceof Error ? error : new Error(String(error)), {
-				tags: { source: 'polling_cycle', projectId: project.id },
+				tags: { source: 'polling_cycle_github', projectId: project.id },
 			});
+		}
+
+		// Poll Jira (if project has Jira integration)
+		if (project.jira?.projectKey) {
+			try {
+				const stats = await pollJiraProject(project, jiraAdapter, triggerRegistry);
+				totalEmitted += stats.emitted;
+				totalErrors += stats.errors;
+			} catch (error) {
+				totalErrors++;
+				logger.error('Failed to poll Jira for project', {
+					projectId: project.id,
+					error: String(error),
+				});
+				captureException(error instanceof Error ? error : new Error(String(error)), {
+					tags: { source: 'polling_cycle_jira', projectId: project.id },
+				});
+			}
 		}
 	}
 
@@ -170,9 +197,9 @@ async function runPollCycle(triggerRegistry: TriggerRegistry): Promise<void> {
 }
 
 /**
- * Poll a single project.
+ * Poll GitHub for a single project.
  */
-async function pollProject(
+async function pollGitHubProject(
 	project: ProjectConfig,
 	adapter: ReturnType<typeof getPollingAdapter>,
 	triggerRegistry: TriggerRegistry,
@@ -241,6 +268,85 @@ async function pollProject(
 	);
 	stats.emitted += mergedPRResult.emitted;
 	stats.errors += mergedPRResult.errors;
+
+	return stats;
+}
+
+/**
+ * Create a Jira API client for a project.
+ */
+function createJiraApiClient(baseUrl: string, auth: string): JiraApiClient {
+	return {
+		async searchIssues(params: {
+			jql: string;
+			fields: string[];
+			expand: string[];
+			nextPageToken?: string;
+		}): Promise<JiraSearchResponse> {
+			const url = new URL(`${baseUrl}/rest/api/3/search/jql`);
+			url.searchParams.set('jql', params.jql);
+			url.searchParams.set('fields', params.fields.join(','));
+			url.searchParams.set('expand', params.expand.join(','));
+			if (params.nextPageToken) {
+				url.searchParams.set('nextPageToken', params.nextPageToken);
+			}
+
+			const response = await fetch(url.toString(), {
+				headers: {
+					Authorization: `Basic ${auth}`,
+					Accept: 'application/json',
+				},
+			});
+
+			if (!response.ok) {
+				const text = await response.text();
+				throw new Error(`Jira API error ${response.status}: ${text}`);
+			}
+
+			return response.json() as Promise<JiraSearchResponse>;
+		},
+	};
+}
+
+/**
+ * Poll Jira for a single project.
+ */
+async function pollJiraProject(
+	project: ProjectConfig,
+	adapter: ReturnType<typeof getPollingAdapter>,
+	triggerRegistry: TriggerRegistry,
+): Promise<{ emitted: number; errors: number }> {
+	const stats = { emitted: 0, errors: 0 };
+
+	const jiraProjectKey = project.jira?.projectKey;
+	if (!jiraProjectKey) {
+		return stats;
+	}
+
+	// Get Jira credentials
+	const jiraCreds = await resolveJiraCredentials(project.id);
+	if (!jiraCreds) {
+		logger.warn('No Jira credentials for project, skipping', { projectId: project.id });
+		return stats;
+	}
+
+	// Get bot account ID for loop protection
+	const botAccountId = await resolveJiraBotAccountId(project.id);
+
+	// Create Jira API client
+	const jiraClient = createJiraApiClient(jiraCreds.baseUrl, jiraCreds.auth);
+
+	// Poll status changes
+	const statusResult = await pollJiraStatusChanges(
+		project.id,
+		jiraProjectKey,
+		jiraClient,
+		botAccountId,
+		adapter,
+		triggerRegistry,
+	);
+	stats.emitted += statusResult.emitted;
+	stats.errors += statusResult.errors;
 
 	return stats;
 }
