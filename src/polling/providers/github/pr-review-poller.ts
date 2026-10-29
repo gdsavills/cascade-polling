@@ -205,7 +205,10 @@ export async function pollPRReviewsForRepo(
 	result.total = allReviews.length;
 
 	if (allReviews.length === 0) {
-		await updateWatermark(projectId, repoFullName, new Date());
+		// Only update watermark if no errors occurred (e.g., all listReviews calls succeeded)
+		if (result.errors === 0) {
+			await updateWatermark(projectId, repoFullName, new Date());
+		}
 		return result;
 	}
 

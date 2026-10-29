@@ -349,6 +349,35 @@ describe('pollPRReviewsForRepo', () => {
 			// mockInsert is called for watermark upsert
 			expect(mockInsert).not.toHaveBeenCalled();
 		});
+
+		it('does NOT advance watermark when all listReviews calls fail (empty allReviews)', async () => {
+			const pr1 = createMockPR({ number: 41 });
+			const pr2 = createMockPR({ number: 42 });
+
+			const octokit = {
+				pulls: {
+					list: vi.fn().mockResolvedValue({ data: [pr1, pr2] }),
+					listReviews: vi.fn().mockRejectedValue(new Error('API rate limit exceeded')),
+				},
+			} as unknown as Parameters<typeof pollPRReviewsForRepo>[3];
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			// Both listReviews calls failed
+			expect(result.errors).toBe(2);
+			expect(result.total).toBe(0);
+			expect(result.emitted).toBe(0);
+
+			// Watermark should NOT be updated because errors > 0 (even though allReviews is empty)
+			expect(mockInsert).not.toHaveBeenCalled();
+		});
 	});
 
 	describe('stale PR optimization', () => {
