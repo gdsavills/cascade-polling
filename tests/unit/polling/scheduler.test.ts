@@ -161,9 +161,9 @@ describe('startPollingScheduler', () => {
 
 		await startPollingScheduler();
 
-		expect(Queue).toHaveBeenCalledWith('polling:scheduler', expect.any(Object));
+		expect(Queue).toHaveBeenCalledWith('polling-scheduler', expect.any(Object));
 		expect(Worker).toHaveBeenCalledWith(
-			'polling:scheduler',
+			'polling-scheduler',
 			expect.any(Function),
 			expect.objectContaining({
 				concurrency: 1,

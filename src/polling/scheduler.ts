@@ -29,7 +29,7 @@ import {
 	pollJiraStatusChanges,
 } from './providers/jira/index.js';
 
-const QUEUE_NAME = 'polling:scheduler';
+const QUEUE_NAME = 'polling-scheduler';
 const JOB_NAME = 'poll-cycle';
 
 let queue: Queue | null = null;
