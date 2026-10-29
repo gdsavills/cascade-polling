@@ -6,16 +6,18 @@
  */
 
 import { GitHubRouterAdapter } from '../router/adapters/github.js';
+import { JiraRouterAdapter } from '../router/adapters/jira.js';
 import type { RouterPlatformAdapter } from '../router/platform-adapter.js';
 
 /**
  * Get the appropriate router adapter for a provider.
- * Currently only GitHub is supported for polling.
  */
 export function getPollingAdapter(provider: 'github' | 'jira'): RouterPlatformAdapter {
 	if (provider === 'github') {
 		return new GitHubRouterAdapter();
 	}
-	// JIRA adapter will be added when Jira poller is implemented
+	if (provider === 'jira') {
+		return new JiraRouterAdapter();
+	}
 	throw new Error(`Polling adapter not implemented for provider: ${provider}`);
 }
