@@ -68,6 +68,10 @@ function createMockOctokit(
 	} as unknown as Parameters<typeof pollPRReviewsForRepo>[3];
 }
 
+/**
+ * Create a mock PR based on GitHub Pull Request API response.
+ * Source: https://docs.github.com/en/rest/pulls/pulls#list-pull-requests
+ */
 function createMockPR(
 	overrides: Partial<{
 		number: number;
@@ -96,6 +100,10 @@ function createMockPR(
 	};
 }
 
+/**
+ * Create a mock PR review based on GitHub Pull Request Review API response.
+ * Source: https://docs.github.com/en/rest/pulls/reviews#list-reviews-for-a-pull-request
+ */
 function createMockReview(
 	overrides: Partial<{
 		id: number;

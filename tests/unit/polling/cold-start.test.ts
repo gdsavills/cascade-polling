@@ -62,6 +62,10 @@ function createMockOctokit(workflowRuns: unknown[] = []) {
 	} as unknown as Parameters<typeof handleGitHubRepoColdStart>[3];
 }
 
+/**
+ * Create a mock workflow run based on GitHub Actions API response.
+ * Source: https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-repository
+ */
 function createWorkflowRun(
 	overrides: Partial<{
 		id: number;
@@ -262,6 +266,7 @@ describe('handleGitHubRepoColdStart', () => {
 });
 
 // Helper functions for Jira cold start tests
+
 function createMockJiraClient(issues: JiraIssue[] = []): JiraApiClient {
 	return {
 		searchIssues: vi.fn().mockResolvedValue({
@@ -271,6 +276,10 @@ function createMockJiraClient(issues: JiraIssue[] = []): JiraApiClient {
 	};
 }
 
+/**
+ * Create a mock Jira issue based on Jira Cloud REST API v3 Search response.
+ * Source: https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/
+ */
 function createMockJiraIssue(
 	overrides: Partial<{
 		id: string;
@@ -300,6 +309,10 @@ function createMockJiraIssue(
 	};
 }
 
+/**
+ * Create a mock Jira changelog history based on expand=changelog response.
+ * Source: https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-changelog-get
+ */
 function createMockJiraHistory(
 	overrides: Partial<{
 		id: string;

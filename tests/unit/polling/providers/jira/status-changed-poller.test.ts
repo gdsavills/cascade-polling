@@ -69,6 +69,10 @@ function createMockJiraClient(issues: JiraIssue[] = []): JiraApiClient {
 	};
 }
 
+/**
+ * Create a mock Jira issue based on Jira Cloud REST API v3 Search response.
+ * Source: https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/
+ */
 function createMockIssue(
 	overrides: Partial<{
 		id: string;
@@ -98,6 +102,10 @@ function createMockIssue(
 	};
 }
 
+/**
+ * Create a mock Jira changelog history based on expand=changelog response.
+ * Source: https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-changelog-get
+ */
 function createMockHistory(
 	overrides: Partial<{
 		id: string;

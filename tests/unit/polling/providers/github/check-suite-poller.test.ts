@@ -62,6 +62,10 @@ function createMockOctokit(workflowRuns: unknown[] = []) {
 	} as unknown as Parameters<typeof pollCheckSuitesForRepo>[3];
 }
 
+/**
+ * Create a mock workflow run based on GitHub Actions API response.
+ * Source: https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-repository
+ */
 function createWorkflowRun(
 	overrides: Partial<{
 		id: number;
