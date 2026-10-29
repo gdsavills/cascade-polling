@@ -141,10 +141,12 @@ function calculateLookbackMinutes(watermark: Date | null, overlapMinutes: number
 /**
  * Poll Jira for status changes for a single project.
  *
+ * NOTE: No author/bot filtering is applied. Cascade uses the user's own Jira
+ * account, so filtering by author would drop every manual status move.
+ *
  * @param projectId - Cascade project ID
  * @param jiraProjectKey - Jira project key (e.g., "PROJ")
  * @param jiraClient - Jira API client
- * @param botAccountId - Account ID of the Jira bot (for loop protection)
  * @param adapter - Router platform adapter
  * @param triggerRegistry - Trigger registry for dispatch
  */
@@ -152,7 +154,6 @@ export async function pollJiraStatusChanges(
 	projectId: string,
 	jiraProjectKey: string,
 	jiraClient: JiraApiClient,
-	botAccountId: string | null,
 	adapter: RouterPlatformAdapter,
 	triggerRegistry: TriggerRegistry,
 ): Promise<JiraStatusChangedPollResult> {
@@ -250,15 +251,8 @@ export async function pollJiraStatusChanges(
 			const changeTime = new Date(history.created);
 			if (changeTime <= watermarkTime) continue;
 
-			// Loop protection: skip changes made by the bot account
-			if (botAccountId && history.author.accountId === botAccountId) {
-				logger.debug('Skipping self-authored status change', {
-					issueKey: issue.key,
-					historyId: history.id,
-					authorAccountId: history.author.accountId,
-				});
-				continue;
-			}
+			// NOTE: No author/bot filtering — Cascade uses the user's own Jira
+			// account, so filtering by author would drop every manual status move.
 
 			const dedupKey = buildJiraStatusChangedDedupKey(jiraProjectKey, issue.key, history.id);
 			statusChangeEvents.push({ issue, history, statusChange, dedupKey });

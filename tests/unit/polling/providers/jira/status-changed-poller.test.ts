@@ -145,7 +145,7 @@ describe('pollJiraStatusChanges', () => {
 			});
 			const jiraClient = createMockJiraClient([issue]);
 
-			await pollJiraStatusChanges('p1', 'PROJ', jiraClient, null, mockAdapter, mockTriggerRegistry);
+			await pollJiraStatusChanges('p1', 'PROJ', jiraClient, mockAdapter, mockTriggerRegistry);
 
 			expect(mockInsert).toHaveBeenCalled();
 			expect(mockValues).toHaveBeenCalledWith(
@@ -198,7 +198,7 @@ describe('pollJiraStatusChanges', () => {
 
 			const jiraClient = createMockJiraClient([]);
 
-			await pollJiraStatusChanges('p1', 'PROJ', jiraClient, null, mockAdapter, mockTriggerRegistry);
+			await pollJiraStatusChanges('p1', 'PROJ', jiraClient, mockAdapter, mockTriggerRegistry);
 
 			// Should have called searchIssues with JQL containing the lookback minutes
 			expect(jiraClient.searchIssues).toHaveBeenCalledWith(
@@ -209,11 +209,13 @@ describe('pollJiraStatusChanges', () => {
 		});
 	});
 
-	describe('bot account filtering', () => {
-		it('skips changes made by bot account (loop protection)', async () => {
-			const botAccountId = 'bot-account-123';
+	describe('no author filtering (Cascade uses user account)', () => {
+		it('emits status changes even when authored by the same account Cascade uses', async () => {
+			// Cascade uses the user's own Jira account, so we must NOT filter
+			// by author — doing so would drop every manual status move.
+			const cascadeAccountId = 'cascade-user-account-123';
 			const history = createMockHistory({
-				authorAccountId: botAccountId,
+				authorAccountId: cascadeAccountId,
 				created: new Date(Date.now() + 60000).toISOString(),
 			});
 			const issue = createMockIssue({
@@ -225,35 +227,11 @@ describe('pollJiraStatusChanges', () => {
 				'p1',
 				'PROJ',
 				jiraClient,
-				botAccountId,
 				mockAdapter,
 				mockTriggerRegistry,
 			);
 
-			expect(result.total).toBe(0);
-			expect(dispatchAndRecord).not.toHaveBeenCalled();
-		});
-
-		it('processes changes made by non-bot accounts', async () => {
-			const botAccountId = 'bot-account-123';
-			const history = createMockHistory({
-				authorAccountId: 'user-account-456',
-				created: new Date(Date.now() + 60000).toISOString(),
-			});
-			const issue = createMockIssue({
-				changelog: { histories: [history] },
-			});
-			const jiraClient = createMockJiraClient([issue]);
-
-			const result = await pollJiraStatusChanges(
-				'p1',
-				'PROJ',
-				jiraClient,
-				botAccountId,
-				mockAdapter,
-				mockTriggerRegistry,
-			);
-
+			// Status change by the same account MUST be emitted (no bot filtering)
 			expect(result.total).toBe(1);
 			expect(result.emitted).toBe(1);
 			expect(dispatchAndRecord).toHaveBeenCalledTimes(1);
@@ -272,7 +250,7 @@ describe('pollJiraStatusChanges', () => {
 			});
 			const jiraClient = createMockJiraClient([issue]);
 
-			await pollJiraStatusChanges('p1', 'PROJ', jiraClient, null, mockAdapter, mockTriggerRegistry);
+			await pollJiraStatusChanges('p1', 'PROJ', jiraClient, mockAdapter, mockTriggerRegistry);
 
 			const expectedDedupKey = buildJiraStatusChangedDedupKey('PROJ', 'PROJ-456', 'hist-789');
 			expect(expectedDedupKey).toBe('jira:PROJ:status_changed:PROJ-456:hist-789');
@@ -308,7 +286,7 @@ describe('pollJiraStatusChanges', () => {
 			});
 			const jiraClient = createMockJiraClient([issue]);
 
-			await pollJiraStatusChanges('p1', 'PROJ', jiraClient, null, mockAdapter, mockTriggerRegistry);
+			await pollJiraStatusChanges('p1', 'PROJ', jiraClient, mockAdapter, mockTriggerRegistry);
 
 			expect(dispatchAndRecord).toHaveBeenCalledWith(
 				'p1',

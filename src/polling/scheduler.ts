@@ -8,7 +8,6 @@
 import { Octokit } from '@octokit/rest';
 import { type ConnectionOptions, Queue, Worker } from 'bullmq';
 import { getProjectGitHubToken } from '../config/projects.js';
-import { resolveJiraBotAccountId } from '../router/bot-identity-resolvers.js';
 import { loadProjectConfig } from '../router/config.js';
 import { resolveJiraCredentials } from '../router/platformClients/index.js';
 import { captureException } from '../sentry.js';
@@ -330,18 +329,16 @@ async function pollJiraProject(
 		return stats;
 	}
 
-	// Get bot account ID for loop protection
-	const botAccountId = await resolveJiraBotAccountId(project.id);
-
 	// Create Jira API client
 	const jiraClient = createJiraApiClient(jiraCreds.baseUrl, jiraCreds.auth);
 
 	// Poll status changes
+	// NOTE: No author/bot filtering — Cascade uses the user's own Jira account,
+	// so filtering by author would drop every manual status move.
 	const statusResult = await pollJiraStatusChanges(
 		project.id,
 		jiraProjectKey,
 		jiraClient,
-		botAccountId,
 		adapter,
 		triggerRegistry,
 	);
