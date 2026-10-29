@@ -142,10 +142,24 @@ export async function pollPRReviewsForRepo(
 		return result;
 	}
 
-	// Collect all reviews from all open PRs
+	// Filter to PRs updated since the watermark - skip stale PRs to reduce API calls
+	// A PR that hasn't been updated cannot have new reviews
+	const recentlyUpdatedPRs = openPRs.filter((pr) => {
+		if (!pr.updated_at) return true; // Include if no updated_at (defensive)
+		return new Date(pr.updated_at) > sinceDate;
+	});
+
+	logger.debug('PR review poll - filtered by updated_at', {
+		repoFullName,
+		totalOpenPRs: openPRs.length,
+		recentlyUpdatedPRs: recentlyUpdatedPRs.length,
+		skippedStalePRs: openPRs.length - recentlyUpdatedPRs.length,
+	});
+
+	// Collect all reviews from recently updated PRs only
 	const allReviews: Array<{ review: GitHubPRReview; pr: GitHubPullRequest }> = [];
 
-	for (const pr of openPRs) {
+	for (const pr of recentlyUpdatedPRs) {
 		try {
 			const { data: reviews } = await octokit.pulls.listReviews({
 				owner,

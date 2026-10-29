@@ -343,6 +343,49 @@ describe('pollPRReviewsForRepo', () => {
 		});
 	});
 
+	describe('stale PR optimization', () => {
+		it('skips listReviews for PRs not updated since watermark', async () => {
+			const watermarkDate = new Date('2024-06-01T12:00:00Z');
+			mockFindFirst.mockResolvedValueOnce({ watermark: watermarkDate });
+
+			// PR 41 was updated BEFORE watermark - should be skipped
+			const stalePR = createMockPR({
+				number: 41,
+				updated_at: '2024-05-15T10:00:00Z',
+			});
+			// PR 42 was updated AFTER watermark - should be checked
+			const recentPR = createMockPR({
+				number: 42,
+				updated_at: '2024-06-15T10:00:00Z',
+			});
+
+			const reviewsMap = new Map([
+				[41, [createMockReview({ id: 100, submitted_at: '2024-06-02T10:00:00Z' })]],
+				[42, [createMockReview({ id: 101, submitted_at: '2024-06-15T10:00:00Z' })]],
+			]);
+
+			const octokit = createMockOctokit([stalePR, recentPR], reviewsMap);
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			// listReviews should only be called for PR 42 (recent), not PR 41 (stale)
+			expect(octokit.pulls.listReviews).toHaveBeenCalledTimes(1);
+			expect(octokit.pulls.listReviews).toHaveBeenCalledWith(
+				expect.objectContaining({ pull_number: 42 }),
+			);
+
+			expect(result.total).toBe(1);
+			expect(result.emitted).toBe(1);
+		});
+	});
+
 	describe('PENDING reviews', () => {
 		it('skips PENDING reviews', async () => {
 			const pendingReview = createMockReview({
