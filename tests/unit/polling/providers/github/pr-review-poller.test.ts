@@ -296,6 +296,53 @@ describe('pollPRReviewsForRepo', () => {
 		});
 	});
 
+	describe('listReviews API errors', () => {
+		it('increments errors when listReviews fails, preventing watermark advance', async () => {
+			const pr1 = createMockPR({ number: 41 });
+			const pr2 = createMockPR({ number: 42 });
+
+			const octokit = {
+				pulls: {
+					list: vi.fn().mockResolvedValue({ data: [pr1, pr2] }),
+					listReviews: vi.fn().mockImplementation(({ pull_number }: { pull_number: number }) => {
+						if (pull_number === 41) {
+							// PR 41 fails
+							return Promise.reject(new Error('API rate limit exceeded'));
+						}
+						// PR 42 has a review
+						return Promise.resolve({
+							data: [
+								createMockReview({
+									id: 200,
+									submitted_at: new Date(Date.now() + 60000).toISOString(),
+								}),
+							],
+						});
+					}),
+				},
+			} as unknown as Parameters<typeof pollPRReviewsForRepo>[3];
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			// Should have 1 error from the failed listReviews call
+			expect(result.errors).toBe(1);
+			// Should still have found and emitted the review from PR 42
+			expect(result.total).toBe(1);
+			expect(result.emitted).toBe(1);
+
+			// Watermark should NOT be updated because errors > 0
+			// mockInsert is called for watermark upsert
+			expect(mockInsert).not.toHaveBeenCalled();
+		});
+	});
+
 	describe('PENDING reviews', () => {
 		it('skips PENDING reviews', async () => {
 			const pendingReview = createMockReview({

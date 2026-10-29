@@ -178,6 +178,8 @@ export async function pollPRReviewsForRepo(
 				});
 			}
 		} catch (error) {
+			// Increment errors so watermark does NOT advance when review fetch fails
+			result.errors++;
 			logger.warn('Failed to fetch reviews for PR', {
 				repoFullName,
 				prNumber: pr.number,
