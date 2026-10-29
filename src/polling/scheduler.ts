@@ -18,7 +18,7 @@ import { logger } from '../utils/logging.js';
 import { parseRedisUrl } from '../utils/redis.js';
 import { getPollingAdapter } from './adapter.js';
 import * as cleanup from './cleanup.js';
-import { handleGitHubRepoColdStart } from './cold-start.js';
+import { handleGitHubRepoColdStart, handleJiraColdStart } from './cold-start.js';
 import { pollingConfig } from './config.js';
 import { pollCheckSuitesForRepo } from './providers/github/check-suite-poller.js';
 import { pollMergedPRsForRepo } from './providers/github/merged-pr-poller.js';
@@ -371,6 +371,9 @@ async function pollJiraProject(
 
 	// Create Jira API client
 	const jiraClient = createJiraApiClient(jiraCreds.baseUrl, jiraCreds.auth);
+
+	// Handle cold start (seeds ledger without dispatch on first poll)
+	await handleJiraColdStart(project.id, jiraProjectKey, jiraClient);
 
 	// Poll status changes
 	// NOTE: No author/bot filtering — Cascade uses the user's own Jira account,

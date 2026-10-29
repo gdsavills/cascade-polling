@@ -37,11 +37,17 @@ vi.mock('../../../src/utils/logging.js', () => ({
 	},
 }));
 
-import { handleGitHubRepoColdStart } from '../../../src/polling/cold-start.js';
+import { handleGitHubRepoColdStart, handleJiraColdStart } from '../../../src/polling/cold-start.js';
 import {
 	buildCheckSuiteDedupKey,
 	type GitHubWorkflowRun,
 } from '../../../src/polling/providers/github/types.js';
+import type { JiraApiClient } from '../../../src/polling/providers/jira/status-changed-poller.js';
+import {
+	buildJiraStatusChangedDedupKey,
+	type JiraChangelogHistory,
+	type JiraIssue,
+} from '../../../src/polling/providers/jira/types.js';
 
 function createMockOctokit(workflowRuns: unknown[] = []) {
 	return {
@@ -252,5 +258,164 @@ describe('handleGitHubRepoColdStart', () => {
 			);
 			expect(insertedValues).toBeDefined();
 		});
+	});
+});
+
+// Helper functions for Jira cold start tests
+function createMockJiraClient(issues: JiraIssue[] = []): JiraApiClient {
+	return {
+		searchIssues: vi.fn().mockResolvedValue({
+			issues,
+			isLast: true,
+		}),
+	};
+}
+
+function createMockJiraIssue(
+	overrides: Partial<{
+		id: string;
+		key: string;
+		summary: string;
+		statusId: string;
+		statusName: string;
+		projectKey: string;
+		changelog: { histories: JiraChangelogHistory[] };
+	}> = {},
+): JiraIssue {
+	return {
+		id: overrides.id ?? '10001',
+		key: overrides.key ?? 'PROJ-123',
+		fields: {
+			summary: overrides.summary ?? 'Test Issue',
+			status: {
+				id: overrides.statusId ?? '10002',
+				name: overrides.statusName ?? 'To Do',
+			},
+			project: {
+				key: overrides.projectKey ?? 'PROJ',
+			},
+			updated: new Date().toISOString(),
+		},
+		changelog: overrides.changelog,
+	};
+}
+
+function createMockJiraHistory(
+	overrides: Partial<{
+		id: string;
+		created: string;
+		authorAccountId: string;
+		statusFrom: string;
+		statusTo: string;
+	}> = {},
+): JiraChangelogHistory {
+	return {
+		id: overrides.id ?? 'history-123',
+		created: overrides.created ?? new Date().toISOString(),
+		author: {
+			accountId: overrides.authorAccountId ?? 'user-account-id',
+		},
+		items: [
+			{
+				field: 'status',
+				from: overrides.statusFrom ?? '10001',
+				to: overrides.statusTo ?? '10002',
+				fromString: 'Backlog',
+				toString: 'To Do',
+			},
+		],
+	};
+}
+
+describe('handleJiraColdStart', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockFindFirst.mockResolvedValue(undefined); // No watermarks by default
+		mockInsert.mockReturnValue({ values: mockValues });
+		mockValues.mockReturnValue({ onConflictDoNothing: mockOnConflictDoNothing });
+	});
+
+	it('seeds status change history IDs without dispatching', async () => {
+		const history1 = createMockJiraHistory({ id: 'hist-1' });
+		const history2 = createMockJiraHistory({ id: 'hist-2' });
+		const issue = createMockJiraIssue({
+			key: 'PROJ-123',
+			changelog: { histories: [history1, history2] },
+		});
+		const jiraClient = createMockJiraClient([issue]);
+
+		await handleJiraColdStart('p1', 'PROJ', jiraClient);
+
+		expect(mockBatchRecordWithoutDispatch).toHaveBeenCalledTimes(1);
+		const events = mockBatchRecordWithoutDispatch.mock.calls[0][2];
+		expect(events).toHaveLength(2);
+		expect(events[0].eventType).toBe('status_changed');
+		expect(events[1].eventType).toBe('status_changed');
+	});
+
+	it('skips cold start if Jira project already has watermarks', async () => {
+		mockFindFirst.mockResolvedValueOnce({
+			projectId: 'p1',
+			provider: 'jira',
+			resourceId: 'PROJ',
+			watermark: new Date(),
+		});
+
+		const issue = createMockJiraIssue({
+			changelog: { histories: [createMockJiraHistory()] },
+		});
+		const jiraClient = createMockJiraClient([issue]);
+
+		const result = await handleJiraColdStart('p1', 'PROJ', jiraClient);
+
+		expect(result.seeded).toBe(0);
+		expect(mockBatchRecordWithoutDispatch).not.toHaveBeenCalled();
+	});
+
+	it('initializes watermark even when no issues found', async () => {
+		const jiraClient = createMockJiraClient([]);
+
+		await handleJiraColdStart('p1', 'PROJ', jiraClient);
+
+		// Should still insert watermark
+		expect(mockInsert).toHaveBeenCalled();
+	});
+
+	it('uses correct dedup key format', async () => {
+		const history = createMockJiraHistory({ id: 'hist-456' });
+		const issue = createMockJiraIssue({
+			key: 'PROJ-789',
+			changelog: { histories: [history] },
+		});
+		const jiraClient = createMockJiraClient([issue]);
+
+		await handleJiraColdStart('p1', 'PROJ', jiraClient);
+
+		const events = mockBatchRecordWithoutDispatch.mock.calls[0][2];
+		const expectedDedupKey = buildJiraStatusChangedDedupKey('PROJ', 'PROJ-789', 'hist-456');
+		expect(events[0].dedupKey).toBe(expectedDedupKey);
+		expect(expectedDedupKey).toBe('jira:PROJ:status_changed:PROJ-789:hist-456');
+	});
+
+	it('only records status change changelog items', async () => {
+		// Issue with both status and non-status changes
+		const statusHistory = createMockJiraHistory({ id: 'status-hist' });
+		const nonStatusHistory: JiraChangelogHistory = {
+			id: 'assignee-hist',
+			created: new Date().toISOString(),
+			author: { accountId: 'user' },
+			items: [{ field: 'assignee', from: 'old', to: 'new' }],
+		};
+		const issue = createMockJiraIssue({
+			changelog: { histories: [statusHistory, nonStatusHistory] },
+		});
+		const jiraClient = createMockJiraClient([issue]);
+
+		await handleJiraColdStart('p1', 'PROJ', jiraClient);
+
+		// Should only record the status change
+		const events = mockBatchRecordWithoutDispatch.mock.calls[0][2];
+		expect(events).toHaveLength(1);
+		expect(events[0].dedupKey).toContain('status-hist');
 	});
 });
