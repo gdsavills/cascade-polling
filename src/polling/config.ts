@@ -37,9 +37,6 @@ export const pollingConfig = {
 
 	/** Dedup ledger retention in days. Default: 30 days. */
 	dedupRetentionDays: parseNumber(process.env.POLLING_DEDUP_RETENTION_DAYS, 30),
-
-	/** Maximum pagination pages for workflow runs (safety limit). Default: 10. */
-	maxPaginationPages: parseNumber(process.env.POLLING_MAX_PAGINATION_PAGES, 10),
 } as const;
 
 /** Type for the polling config object. */

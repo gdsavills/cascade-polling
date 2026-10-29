@@ -14,7 +14,10 @@
 
 import type { Octokit } from '@octokit/rest';
 import type { RouterPlatformAdapter } from '../../../router/platform-adapter.js';
-import { resolveCheckSuitePRNumber } from '../../../triggers/github/pr-resolution.js';
+import {
+	type CheckSuitePRResolution,
+	resolveCheckSuitePRNumber,
+} from '../../../triggers/github/pr-resolution.js';
 import type { TriggerRegistry } from '../../../triggers/registry.js';
 import { logger } from '../../../utils/logging.js';
 import { pollingConfig } from '../../config.js';
@@ -31,6 +34,9 @@ import {
 	type GitHubWorkflowRunsResponse,
 	shouldEmitWorkflowRun,
 } from './types.js';
+
+/** Maximum pagination pages for workflow runs (safety limit). */
+const MAX_PAGINATION_PAGES = 10;
 
 /** Result of a check-suite poll cycle for a single repo. */
 export interface CheckSuitePollResult {
@@ -68,10 +74,9 @@ export async function pollCheckSuitesForRepo(
 	const runs: GitHubWorkflowRun[] = [];
 	let page = 1;
 	const perPage = 100;
-	const maxPages = pollingConfig.maxPaginationPages;
 
 	try {
-		while (page <= maxPages) {
+		while (page <= MAX_PAGINATION_PAGES) {
 			const response = await octokit.actions.listWorkflowRunsForRepo({
 				owner,
 				repo,
@@ -89,12 +94,12 @@ export async function pollCheckSuitesForRepo(
 			}
 			page++;
 
-			if (page > maxPages) {
+			if (page > MAX_PAGINATION_PAGES) {
 				logger.warn('Workflow runs pagination limit reached', {
 					owner,
 					repo,
 					totalFetched: runs.length,
-					maxPages,
+					maxPages: MAX_PAGINATION_PAGES,
 				});
 			}
 		}
@@ -165,35 +170,49 @@ export async function pollCheckSuitesForRepo(
 	// Step 5: PR resolution THIRD (only for new, emittable runs)
 	for (const { run, conclusion, dedupKey } of newCandidates) {
 		// Resolve PR number using existing logic
-		const resolution = await resolveCheckSuitePRNumber({
-			owner,
-			repo,
-			pullRequests: run.pull_requests ?? [],
-			headBranch: run.head_branch ?? undefined,
-			handlerName: 'polling:check-suite',
-			lookupOpenPRByBranch: async (o, r, b) => {
-				try {
-					const { data } = await octokit.pulls.list({
+		let resolution: CheckSuitePRResolution | undefined;
+		let hadTransientError = false;
+		try {
+			resolution = await resolveCheckSuitePRNumber({
+				owner,
+				repo,
+				pullRequests: run.pull_requests ?? [],
+				headBranch: run.head_branch ?? undefined,
+				handlerName: 'polling:check-suite',
+				lookupOpenPRByBranch: async (o, r, b) => {
+					// This throws on transient errors so we can distinguish from "no PR found"
+					const response = await octokit.pulls.list({
 						owner: o,
 						repo: r,
 						head: `${o}:${b}`,
 						state: 'open',
 						per_page: 1,
 					});
-					if (data.length === 0) return null;
+					if (response.data.length === 0) return null;
 					return {
-						number: data[0].number,
-						htmlUrl: data[0].html_url,
-						title: data[0].title,
+						number: response.data[0].number,
+						htmlUrl: response.data[0].html_url,
+						title: response.data[0].title,
 					};
-				} catch {
-					return null;
-				}
-			},
-		});
+				},
+			});
+		} catch (error) {
+			// Transient error (rate limit, network, 5xx) - do NOT record, leave for retry
+			hadTransientError = true;
+			logger.warn('Transient error during PR resolution, will retry next cycle', {
+				runId: run.id,
+				repoFullName,
+				error: String(error),
+			});
+		}
 
-		if (!resolution.ok) {
-			// Record as ignored so we don't retry every cycle
+		if (hadTransientError) {
+			// Do not record - leave unprocessed so next poll cycle retries within lookback window
+			continue;
+		}
+
+		if (!resolution?.ok) {
+			// API succeeded but no PR found - record as ignored so we don't retry every cycle
 			const unresolvableDedupKey = `github:${repoFullName}:unresolvable_pr:${run.id}`;
 			const recorded = await recordWithoutDispatch(
 				projectId,
