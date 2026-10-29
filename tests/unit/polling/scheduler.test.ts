@@ -98,6 +98,11 @@ vi.mock('../../../src/polling/adapter.js', () => ({
 	getPollingAdapter: vi.fn().mockReturnValue({ type: 'github' }),
 }));
 
+// Note: cleanup mock moved to cleanup-scheduling.test.ts for better isolation
+vi.mock('../../../src/polling/cleanup.js', () => ({
+	cleanupPollingLedger: vi.fn().mockResolvedValue(0),
+}));
+
 // Mock sentry
 vi.mock('../../../src/sentry.js', () => ({
 	captureException: vi.fn(),
@@ -280,3 +285,6 @@ describe('stopPollingScheduler', () => {
 		expect(mockLoggerInfo).toHaveBeenCalledWith('Polling scheduler stopped');
 	});
 });
+
+// Note: Cleanup scheduling tests are in cleanup-scheduling.test.ts
+// They test maybeRunLedgerCleanup() directly for better isolation

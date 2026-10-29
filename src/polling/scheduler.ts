@@ -17,6 +17,7 @@ import type { ProjectConfig } from '../types/index.js';
 import { logger } from '../utils/logging.js';
 import { parseRedisUrl } from '../utils/redis.js';
 import { getPollingAdapter } from './adapter.js';
+import * as cleanup from './cleanup.js';
 import { handleGitHubRepoColdStart } from './cold-start.js';
 import { pollingConfig } from './config.js';
 import { pollCheckSuitesForRepo } from './providers/github/check-suite-poller.js';
@@ -34,6 +35,15 @@ const JOB_NAME = 'poll-cycle';
 let queue: Queue | null = null;
 let worker: Worker | null = null;
 let connection: ConnectionOptions | null = null;
+let lastCleanupTime: number | null = null;
+
+/** One day in milliseconds for cleanup interval */
+const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/** Reset cleanup state for testing */
+export function resetCleanupState(): void {
+	lastCleanupTime = null;
+}
 
 /**
  * Initialize the polling scheduler.
@@ -128,6 +138,7 @@ export async function stopPollingScheduler(): Promise<void> {
 	}
 
 	connection = null;
+	lastCleanupTime = null;
 
 	logger.info('Polling scheduler stopped');
 }
@@ -193,6 +204,35 @@ async function runPollCycle(triggerRegistry: TriggerRegistry): Promise<void> {
 		totalErrors,
 		durationMs,
 	});
+
+	// Run ledger cleanup once per day
+	await maybeRunLedgerCleanup();
+}
+
+/**
+ * Run ledger cleanup if 24 hours have passed since last cleanup.
+ * Uses in-memory tracking (single instance assumption per CLAUDE.md).
+ * Exported for testing.
+ */
+export async function maybeRunLedgerCleanup(): Promise<void> {
+	const now = Date.now();
+
+	// Skip if we've run cleanup within the last 24 hours
+	if (lastCleanupTime !== null && now - lastCleanupTime < CLEANUP_INTERVAL_MS) {
+		return;
+	}
+
+	try {
+		const rowsDeleted = await cleanup.cleanupPollingLedger();
+		lastCleanupTime = now;
+		logger.info('Ledger cleanup completed', { rowsDeleted });
+	} catch (error) {
+		// Log but don't fail the poll cycle for cleanup errors
+		logger.error('Ledger cleanup failed', { error: String(error) });
+		captureException(error instanceof Error ? error : new Error(String(error)), {
+			tags: { source: 'polling_ledger_cleanup' },
+		});
+	}
 }
 
 /**
