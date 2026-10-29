@@ -12,6 +12,7 @@ import { registerBuiltInEngines } from '../backends/bootstrap.js';
 import { initAgentMessages } from '../config/agentMessages.js';
 import { validateCredentialMasterKey } from '../db/crypto.js';
 import { seedAgentDefinitions } from '../db/seeds/seedAgentDefinitions.js';
+import { startPollingScheduler, stopPollingScheduler } from '../polling/index.js';
 import { registerBuiltInTriggers } from '../triggers/builtins.js';
 import { createTriggerRegistry } from '../triggers/registry.js';
 import { logger } from '../utils/logging.js';
@@ -202,6 +203,7 @@ app.post(
 // Graceful shutdown
 async function shutdown(signal: string): Promise<void> {
 	logger.info('Received shutdown signal', { signal });
+	await stopPollingScheduler();
 	await stopCancelListener();
 	await stopWorkerProcessor();
 	await flush(3000);
@@ -241,6 +243,9 @@ async function startRouter(): Promise<void> {
 
 	// Start cancel listener for handling run cancellations
 	await startCancelListener();
+
+	// Start polling scheduler (no-op if POLLING_ENABLED is false)
+	await startPollingScheduler();
 
 	startWorkerProcessor();
 	logger.info('Starting router', { port, instanceId: ROUTER_INSTANCE_ID });
