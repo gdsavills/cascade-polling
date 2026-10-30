@@ -57,7 +57,15 @@ function truncateHookOutput(raw: string | undefined, label: 'commit' | 'push'): 
 }
 
 async function detectOwnerRepo(): Promise<{ owner: string; repo: string }> {
-	const result = await runCommand('git', ['remote', 'get-url', 'origin'], process.cwd());
+	const result = await runCommand(
+		'git',
+		['remote', 'get-url', 'origin'],
+		process.cwd(),
+		undefined,
+		{
+			silent: true,
+		},
+	);
 	if (result.exitCode !== 0) {
 		throw new Error('Failed to detect repository: no git remote "origin" found');
 	}
