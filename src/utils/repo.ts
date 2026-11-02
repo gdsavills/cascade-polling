@@ -106,6 +106,17 @@ const DEFAULT_WALL_TIMEOUT_MS = 600_000;
 const DEFAULT_FORCE_KILL_AFTER_MS = 5_000;
 
 /**
+ * Redact credentials from URLs in text.
+ * Replaces https://TOKEN@host or http://user:pass@host with https://***@host.
+ * Prevents tokens from leaking into logs or captured output.
+ */
+export function redactUrlCredentials(text: string): string {
+	// Match http(s)://USERINFO@host where USERINFO is anything before @
+	// Captures: (protocol)(userinfo)(rest of URL starting with @)
+	return text.replace(/\b(https?:\/\/)([^@\s]+)(@)/gi, '$1***$3');
+}
+
+/**
  * Internal. Manages the three timers (heartbeat, idle, wall) + SIGTERM→SIGKILL
  * ladder for a subprocess. Returned handle's `noteOutput` resets heartbeat + idle.
  */
@@ -239,7 +250,9 @@ export async function runCommand(
 	const watcher = createSubprocessWatcher(child.pid, config, Date.now());
 	const capture = { stdout: '', stderr: '' };
 	const onChunk = (chunk: unknown, kind: 'stdout' | 'stderr') => {
-		const text = typeof chunk === 'string' ? chunk : String(chunk);
+		const raw = typeof chunk === 'string' ? chunk : String(chunk);
+		// Redact credentials BEFORE capture and echo to prevent token leaks
+		const text = redactUrlCredentials(raw);
 		capture[kind] += text;
 		if (!config.silent) process.stderr.write(text);
 		watcher.noteOutput();
