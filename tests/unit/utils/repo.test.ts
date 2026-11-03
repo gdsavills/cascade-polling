@@ -46,6 +46,7 @@ import {
 	createTempDir,
 	getWorkspaceDir,
 	parseRepoFullName,
+	redactUrlCredentials,
 	runCommand,
 } from '../../../src/utils/repo.js';
 
@@ -600,5 +601,139 @@ describe('repo utils', () => {
 			// reason is optional; undefined on natural exit
 			expect(result.reason).toBeUndefined();
 		});
+
+		describe('credential redaction', () => {
+			// Use a clearly FAKE token that looks like a real GitHub PAT format
+			const FAKE_TOKEN = 'ghp_000000000000000000000000000000000000';
+			const FAKE_URL = `https://${FAKE_TOKEN}@github.com/owner/repo.git`;
+
+			it('redacts credentials in captured stdout', async () => {
+				const child = createMockSubprocess();
+				vi.mocked(execa).mockReturnValue(child as unknown as ReturnType<typeof execa>);
+
+				const promise = runCommand('git', ['remote', 'get-url', 'origin'], '/tmp');
+				await new Promise((r) => setTimeout(r, 0));
+
+				// Simulate git printing a URL with embedded token
+				child.stdout.push(FAKE_URL + '\n');
+				child.stdout.push(null);
+				child.stderr.push(null);
+				child.resolveExec({ stdout: FAKE_URL + '\n', stderr: '', exitCode: 0 });
+
+				const result = await promise;
+
+				// Token must NOT appear in captured stdout
+				expect(result.stdout).not.toContain(FAKE_TOKEN);
+				// Redacted URL should still be parseable for owner/repo
+				expect(result.stdout).toContain('github.com/owner/repo');
+				expect(result.stdout).toContain('***@');
+			});
+
+			it('redacts credentials in captured stderr', async () => {
+				const child = createMockSubprocess();
+				vi.mocked(execa).mockReturnValue(child as unknown as ReturnType<typeof execa>);
+
+				const promise = runCommand('git', ['push'], '/tmp');
+				await new Promise((r) => setTimeout(r, 0));
+
+				// Simulate git printing URL in error message
+				child.stderr.push(`fatal: unable to access '${FAKE_URL}': error\n`);
+				child.stdout.push(null);
+				child.stderr.push(null);
+				child.resolveExec({
+					stdout: '',
+					stderr: `fatal: unable to access '${FAKE_URL}': error\n`,
+					exitCode: 1,
+				});
+
+				const result = await promise;
+
+				// Token must NOT appear in captured stderr
+				expect(result.stderr).not.toContain(FAKE_TOKEN);
+				expect(result.stderr).toContain('***@');
+			});
+
+			it('redacts credentials before echoing to parent stderr', async () => {
+				const child = createMockSubprocess();
+				vi.mocked(execa).mockReturnValue(child as unknown as ReturnType<typeof execa>);
+
+				const promise = runCommand('git', ['remote', 'get-url', 'origin'], '/tmp');
+				await new Promise((r) => setTimeout(r, 0));
+
+				child.stdout.push(FAKE_URL + '\n');
+				await new Promise((r) => setTimeout(r, 0));
+
+				// Check what was written to stderr - must NOT contain the token
+				const stderrOutput = stderrSpy.mock.calls.map((c) => String(c[0])).join('');
+				expect(stderrOutput).not.toContain(FAKE_TOKEN);
+				expect(stderrOutput).toContain('***@');
+
+				child.stdout.push(null);
+				child.stderr.push(null);
+				child.resolveExec({ stdout: FAKE_URL + '\n', stderr: '', exitCode: 0 });
+				await promise;
+			});
+
+			it('preserves owner/repo parsing after redaction', async () => {
+				const child = createMockSubprocess();
+				vi.mocked(execa).mockReturnValue(child as unknown as ReturnType<typeof execa>);
+
+				const promise = runCommand('git', ['remote', 'get-url', 'origin'], '/tmp', undefined, {
+					silent: true,
+				});
+				await new Promise((r) => setTimeout(r, 0));
+
+				child.stdout.push(FAKE_URL + '\n');
+				child.stdout.push(null);
+				child.stderr.push(null);
+				child.resolveExec({ stdout: FAKE_URL + '\n', stderr: '', exitCode: 0 });
+
+				const result = await promise;
+
+				// Parse owner/repo using the same regex as detectOwnerRepo
+				const match = result.stdout.trim().match(/github\.com[/:]([^/]+)\/(.+?)(?:\.git)?$/);
+				expect(match).toBeTruthy();
+				expect(match?.[1]).toBe('owner');
+				expect(match?.[2]).toBe('repo');
+			});
+		});
+	});
+});
+
+describe('redactUrlCredentials', () => {
+	it('redacts https URLs with token', () => {
+		const input = 'https://ghp_000000000000000000000000000000000000@github.com/owner/repo.git';
+		expect(redactUrlCredentials(input)).toBe('https://***@github.com/owner/repo.git');
+	});
+
+	it('redacts http URLs with user:pass', () => {
+		const input = 'http://user:password123@example.com/path';
+		expect(redactUrlCredentials(input)).toBe('http://***@example.com/path');
+	});
+
+	it('preserves URLs without credentials', () => {
+		const input = 'https://github.com/owner/repo.git';
+		expect(redactUrlCredentials(input)).toBe('https://github.com/owner/repo.git');
+	});
+
+	it('redacts multiple URLs in the same string', () => {
+		const input = 'Fetching https://token1@github.com/a/b and https://token2@github.com/c/d';
+		const result = redactUrlCredentials(input);
+		expect(result).not.toContain('token1');
+		expect(result).not.toContain('token2');
+		expect(result).toContain('https://***@github.com/a/b');
+		expect(result).toContain('https://***@github.com/c/d');
+	});
+
+	it('handles URLs in error messages', () => {
+		const input = "fatal: unable to access 'https://ghp_secret@github.com/owner/repo.git/': error";
+		const result = redactUrlCredentials(input);
+		expect(result).not.toContain('ghp_secret');
+		expect(result).toContain('***@github.com');
+	});
+
+	it('is case-insensitive for protocol', () => {
+		const input = 'HTTPS://TOKEN@GITHUB.COM/owner/repo';
+		expect(redactUrlCredentials(input)).toBe('HTTPS://***@GITHUB.COM/owner/repo');
 	});
 });
