@@ -20,6 +20,20 @@ export interface ProcessRouterWebhookResult {
 	projectId?: string;
 	/** Human-readable explanation of why the event was processed or skipped. */
 	decisionReason?: string;
+	/**
+	 * True when the dispatch was deferred for later re-check (e.g. waiting for
+	 * CI to complete). Polling uses this to avoid recording the event in the
+	 * ledger so it will be re-emitted next cycle.
+	 */
+	deferred?: boolean;
+	/**
+	 * Structured skip reason when a matched handler decided NOT to dispatch.
+	 * Polling uses this to determine whether to record the event in the ledger.
+	 */
+	skipReason?: {
+		handler: string;
+		message: string;
+	};
 }
 
 /**
@@ -117,6 +131,7 @@ function handleStructuredSkip({
 		shouldProcess: true,
 		projectId,
 		decisionReason: `Trigger ${result.skipReason.handler} skipped: ${result.skipReason.message}`,
+		skipReason: result.skipReason,
 	};
 }
 
@@ -162,6 +177,7 @@ async function handleDeferredRecheck({
 		shouldProcess: true,
 		projectId: project.id,
 		decisionReason: `Deferred re-check scheduled: ${result.deferredRecheck.coalesceKey}`,
+		deferred: true,
 	};
 }
 

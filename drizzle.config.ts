@@ -16,6 +16,7 @@ export default defineConfig({
 		'./src/db/schema/integrations.ts',
 		'./src/db/schema/runs.ts',
 		'./src/db/schema/promptPartials.ts',
+		'./src/db/schema/polling.ts',
 	],
 	out: './src/db/migrations',
 	dialect: 'postgresql',

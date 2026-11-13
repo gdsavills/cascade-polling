@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import semver from 'semver';
 import { describe, expect, it } from 'vitest';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
@@ -127,6 +128,70 @@ describe('open-source readiness', () => {
 		});
 	});
 
+	describe('npm overrides', () => {
+		type LockEntry = {
+			version?: string;
+			dev?: boolean;
+			dependencies?: Record<string, string>;
+			optionalDependencies?: Record<string, string>;
+			peerDependencies?: Record<string, string>;
+		};
+
+		// A version's compatibility line: its major, or its minor while still 0.x.
+		const releaseLine = (version: string) =>
+			semver.major(version) > 0 ? `${semver.major(version)}.x` : `0.${semver.minor(version)}.x`;
+
+		// Node module resolution: the nearest node_modules/<name>, walking up from the dependent.
+		function resolveInstalled(
+			packages: Record<string, LockEntry>,
+			dependentPath: string,
+			name: string,
+		): LockEntry | undefined {
+			const candidates: string[] = [];
+			let dir = dependentPath;
+			while (dir) {
+				candidates.push(`${dir}/node_modules/${name}`);
+				const parentEnd = dir.lastIndexOf('/node_modules/');
+				dir = parentEnd === -1 ? '' : dir.slice(0, parentEnd);
+			}
+			candidates.push(`node_modules/${name}`);
+			return candidates.map((candidate) => packages[candidate]).find(Boolean);
+		}
+
+		function offLineOverrides(dir: string): string[] {
+			const overrides = JSON.parse(readRoot(path.join(dir, 'package.json'))).overrides ?? {};
+			const { packages } = JSON.parse(readRoot(path.join(dir, 'package-lock.json'))) as {
+				packages: Record<string, LockEntry>;
+			};
+
+			return Object.entries(packages)
+				.filter(([, entry]) => !entry.dev)
+				.flatMap(([dependentPath, entry]) =>
+					Object.entries({
+						...entry.dependencies,
+						...entry.optionalDependencies,
+						...entry.peerDependencies,
+					})
+						.filter(([name]) => name in overrides)
+						.flatMap(([name, range]) => {
+							const installed = resolveInstalled(packages, dependentPath, name)?.version;
+							return installed && !semver.intersects(range, releaseLine(installed))
+								? [`${dependentPath} declares ${name}@${range}, override installs ${installed}`]
+								: [];
+						}),
+				);
+		}
+
+		it.each([
+			{ workspace: 'root', dir: '.' },
+			{ workspace: 'web/', dir: 'web' },
+		])('$workspace: never move a production package off a release line its dependents declare', ({
+			dir,
+		}) => {
+			expect(offLineOverrides(dir)).toEqual([]);
+		});
+	});
+
 	describe('config/projects.json', () => {
 		const config = JSON.parse(readRoot('config/projects.json'));
 
@@ -150,9 +215,18 @@ describe('open-source readiness', () => {
 	});
 
 	describe('CI configuration', () => {
-		it('includes npm audit step', () => {
-			const content = readRoot('.github/workflows/ci.yml');
-			expect(content).toContain('npm audit');
+		const PROD_AUDIT = 'npm audit --omit=dev --audit-level=high';
+		const ciRunLines = () =>
+			readRoot('.github/workflows/ci.yml')
+				.split('\n')
+				.map((line) => line.trim());
+
+		it('gates root production dependencies on high-severity advisories', () => {
+			expect(ciRunLines()).toContain(`run: ${PROD_AUDIT}`);
+		});
+
+		it('gates web/ production dependencies on high-severity advisories', () => {
+			expect(ciRunLines()).toContain(`run: cd web && ${PROD_AUDIT}`);
 		});
 	});
 

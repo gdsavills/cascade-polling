@@ -1,0 +1,1080 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+// Mock DB before imports
+const mockFindFirst = vi.fn();
+const mockInsert = vi.fn();
+const mockValues = vi.fn();
+const mockOnConflictDoUpdate = vi.fn().mockResolvedValue({ rowCount: 1 });
+
+vi.mock('../../../../../src/db/client.js', () => ({
+	getDb: vi.fn(() => ({
+		query: {
+			pollingWatermarks: {
+				findFirst: mockFindFirst,
+			},
+		},
+		insert: mockInsert,
+	})),
+}));
+
+vi.mock('../../../../../src/polling/config.js', () => ({
+	pollingConfig: {
+		githubPrBatchSize: 50,
+	},
+	WATERMARK_OVERLAP_MS: 5000,
+}));
+
+vi.mock('../../../../../src/polling/dispatch.js', () => ({
+	batchCheckLedger: vi.fn().mockResolvedValue(new Set()),
+	dispatchAndRecord: vi
+		.fn()
+		.mockResolvedValue({ recorded: true, deferred: false, skipped: false, enqueued: true }),
+}));
+
+vi.mock('../../../../../src/utils/logging.js', () => ({
+	logger: {
+		info: vi.fn(),
+		warn: vi.fn(),
+		error: vi.fn(),
+		debug: vi.fn(),
+	},
+}));
+
+import { batchCheckLedger, dispatchAndRecord } from '../../../../../src/polling/dispatch.js';
+import { pollPRReviewsForRepo } from '../../../../../src/polling/providers/github/pr-review-poller.js';
+import { buildPRReviewDedupKey } from '../../../../../src/polling/providers/github/types.js';
+import type { RouterPlatformAdapter } from '../../../../../src/router/platform-adapter.js';
+import type { TriggerRegistry } from '../../../../../src/triggers/registry.js';
+
+const mockAdapter = {
+	type: 'github',
+} as unknown as RouterPlatformAdapter;
+
+const mockTriggerRegistry = {
+	dispatch: vi.fn(),
+} as unknown as TriggerRegistry;
+
+function createMockOctokit(
+	openPRs: unknown[] = [],
+	reviewsMap: Map<number, unknown[]> = new Map(),
+) {
+	return {
+		pulls: {
+			list: vi.fn().mockResolvedValue({ data: openPRs }),
+			listReviews: vi.fn().mockImplementation(({ pull_number }: { pull_number: number }) => {
+				const reviews = reviewsMap.get(pull_number) ?? [];
+				return Promise.resolve({ data: reviews });
+			}),
+		},
+	} as unknown as Parameters<typeof pollPRReviewsForRepo>[3];
+}
+
+/**
+ * Create a mock PR based on GitHub Pull Request API response.
+ * Source: https://docs.github.com/en/rest/pulls/pulls#list-pull-requests
+ */
+function createMockPR(
+	overrides: Partial<{
+		number: number;
+		title: string;
+		body: string | null;
+		state: string;
+		draft: boolean;
+		html_url: string;
+		head: { ref: string; sha: string };
+		base: { ref: string };
+		user: { login: string } | null;
+		merged_at: string | null;
+		updated_at: string;
+	}> = {},
+) {
+	const result: Record<string, unknown> = {
+		number: overrides.number ?? 42,
+		title: overrides.title ?? 'Test PR',
+		body: overrides.body ?? 'PR body',
+		state: overrides.state ?? 'open',
+		html_url: overrides.html_url ?? 'https://github.com/owner/repo/pull/42',
+		head: overrides.head ?? { ref: 'feature/test', sha: 'abc123' },
+		base: overrides.base ?? { ref: 'main' },
+		user: overrides.user ?? { login: 'author' },
+		merged_at: overrides.merged_at ?? null,
+		updated_at: overrides.updated_at ?? new Date().toISOString(),
+	};
+	// Only include draft if explicitly provided (simulates API behavior where field may be absent)
+	if ('draft' in overrides) {
+		result.draft = overrides.draft;
+	}
+	return result;
+}
+
+/**
+ * Create a mock PR review based on GitHub Pull Request Review API response.
+ * Source: https://docs.github.com/en/rest/pulls/reviews#list-reviews-for-a-pull-request
+ */
+function createMockReview(
+	overrides: Partial<{
+		id: number;
+		state: string;
+		body: string | null;
+		html_url: string;
+		user: { login: string } | null;
+		submitted_at: string | null;
+		commit_id: string;
+	}> = {},
+) {
+	return {
+		id: overrides.id ?? 100,
+		state: overrides.state ?? 'APPROVED',
+		body: overrides.body ?? 'LGTM',
+		html_url: overrides.html_url ?? 'https://github.com/owner/repo/pull/42#pullrequestreview-100',
+		user: overrides.user ?? { login: 'reviewer' },
+		submitted_at: overrides.submitted_at ?? new Date().toISOString(),
+		commit_id: overrides.commit_id ?? 'abc123',
+	};
+}
+
+describe('pollPRReviewsForRepo', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockFindFirst.mockResolvedValue(undefined);
+		mockInsert.mockReturnValue({ values: mockValues });
+		mockValues.mockReturnValue({ onConflictDoUpdate: mockOnConflictDoUpdate });
+	});
+
+	describe('watermark filtering', () => {
+		it('skips reviews older than watermark', async () => {
+			const watermarkDate = new Date('2024-06-01T12:00:00Z');
+			mockFindFirst.mockResolvedValueOnce({ watermark: watermarkDate });
+
+			const oldReview = createMockReview({
+				id: 100,
+				submitted_at: '2024-05-15T10:00:00Z', // Before watermark
+			});
+
+			const reviewsMap = new Map([[42, [oldReview]]]);
+			const octokit = createMockOctokit([createMockPR({ number: 42 })], reviewsMap);
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			expect(result.total).toBe(0);
+			expect(result.emitted).toBe(0);
+			expect(dispatchAndRecord).not.toHaveBeenCalled();
+		});
+
+		it('emits reviews after watermark', async () => {
+			const watermarkDate = new Date('2024-06-01T12:00:00Z');
+			mockFindFirst.mockResolvedValueOnce({ watermark: watermarkDate });
+
+			const newReview = createMockReview({
+				id: 101,
+				submitted_at: '2024-06-15T10:00:00Z', // After watermark
+			});
+
+			const reviewsMap = new Map([[42, [newReview]]]);
+			const octokit = createMockOctokit([createMockPR({ number: 42 })], reviewsMap);
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			expect(result.total).toBe(1);
+			expect(result.emitted).toBe(1);
+			expect(dispatchAndRecord).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	describe('watermark updates', () => {
+		it('updates watermark after successful poll', async () => {
+			const newReview = createMockReview({
+				id: 101,
+				submitted_at: '2024-06-15T10:00:00Z',
+			});
+
+			const reviewsMap = new Map([[42, [newReview]]]);
+			const octokit = createMockOctokit([createMockPR({ number: 42 })], reviewsMap);
+
+			await pollPRReviewsForRepo('p1', 'owner', 'repo', octokit, mockAdapter, mockTriggerRegistry);
+
+			expect(mockInsert).toHaveBeenCalled();
+			expect(mockValues).toHaveBeenCalledWith(
+				expect.objectContaining({
+					projectId: 'p1',
+					provider: 'github',
+					resourceType: 'pr_reviews',
+					resourceId: 'owner/repo',
+				}),
+			);
+		});
+	});
+
+	describe('synthetic payload fields', () => {
+		it('sets review.user.login in synthetic payload for loop protection', async () => {
+			const newReview = createMockReview({
+				id: 101,
+				submitted_at: new Date(Date.now() + 60000).toISOString(), // Future to pass watermark
+				user: { login: 'cascade-reviewer' },
+			});
+
+			const reviewsMap = new Map([[42, [newReview]]]);
+			const octokit = createMockOctokit([createMockPR({ number: 42 })], reviewsMap);
+
+			await pollPRReviewsForRepo('p1', 'owner', 'repo', octokit, mockAdapter, mockTriggerRegistry);
+
+			expect(dispatchAndRecord).toHaveBeenCalledWith(
+				'p1',
+				'github',
+				'pr_review',
+				expect.any(String),
+				expect.objectContaining({
+					review: expect.objectContaining({
+						user: { login: 'cascade-reviewer' },
+					}),
+					sender: { login: 'cascade-reviewer' },
+				}),
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+		});
+	});
+
+	describe('dedup key format', () => {
+		it('uses correct dedup key format: github:{owner}/{repo}:pr_review:{pr_number}:{review_id}', async () => {
+			const newReview = createMockReview({
+				id: 12345,
+				submitted_at: new Date(Date.now() + 60000).toISOString(),
+			});
+
+			const reviewsMap = new Map([[99, [newReview]]]);
+			const octokit = createMockOctokit([createMockPR({ number: 99 })], reviewsMap);
+
+			await pollPRReviewsForRepo('p1', 'owner', 'repo', octokit, mockAdapter, mockTriggerRegistry);
+
+			const expectedDedupKey = buildPRReviewDedupKey('owner', 'repo', 99, 12345);
+			expect(expectedDedupKey).toBe('github:owner/repo:pr_review:99:12345');
+
+			expect(dispatchAndRecord).toHaveBeenCalledWith(
+				'p1',
+				'github',
+				'pr_review',
+				expectedDedupKey,
+				expect.any(Object),
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+		});
+	});
+
+	describe('ledger deduplication', () => {
+		it('skips reviews already in ledger', async () => {
+			const review1 = createMockReview({
+				id: 100,
+				submitted_at: new Date(Date.now() + 60000).toISOString(),
+			});
+			const review2 = createMockReview({
+				id: 101,
+				submitted_at: new Date(Date.now() + 60000).toISOString(),
+			});
+
+			const reviewsMap = new Map([[42, [review1, review2]]]);
+			const octokit = createMockOctokit([createMockPR({ number: 42 })], reviewsMap);
+
+			// Mark first review as already processed
+			vi.mocked(batchCheckLedger).mockResolvedValueOnce(
+				new Set(['github:owner/repo:pr_review:42:100']),
+			);
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			expect(result.total).toBe(2);
+			expect(result.skipped).toBe(1);
+			expect(result.emitted).toBe(1);
+			expect(dispatchAndRecord).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	describe('listReviews API errors', () => {
+		it('increments errors when listReviews fails, preventing watermark advance', async () => {
+			const pr1 = createMockPR({ number: 41 });
+			const pr2 = createMockPR({ number: 42 });
+
+			const octokit = {
+				pulls: {
+					list: vi.fn().mockResolvedValue({ data: [pr1, pr2] }),
+					listReviews: vi.fn().mockImplementation(({ pull_number }: { pull_number: number }) => {
+						if (pull_number === 41) {
+							// PR 41 fails
+							return Promise.reject(new Error('API rate limit exceeded'));
+						}
+						// PR 42 has a review
+						return Promise.resolve({
+							data: [
+								createMockReview({
+									id: 200,
+									submitted_at: new Date(Date.now() + 60000).toISOString(),
+								}),
+							],
+						});
+					}),
+				},
+			} as unknown as Parameters<typeof pollPRReviewsForRepo>[3];
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			// Should have 1 error from the failed listReviews call
+			expect(result.errors).toBe(1);
+			// Should still have found and emitted the review from PR 42
+			expect(result.total).toBe(1);
+			expect(result.emitted).toBe(1);
+
+			// Watermark should NOT be updated because errors > 0
+			// mockInsert is called for watermark upsert
+			expect(mockInsert).not.toHaveBeenCalled();
+		});
+
+		it('does NOT advance watermark when all listReviews calls fail (empty allReviews)', async () => {
+			const pr1 = createMockPR({ number: 41 });
+			const pr2 = createMockPR({ number: 42 });
+
+			const octokit = {
+				pulls: {
+					list: vi.fn().mockResolvedValue({ data: [pr1, pr2] }),
+					listReviews: vi.fn().mockRejectedValue(new Error('API rate limit exceeded')),
+				},
+			} as unknown as Parameters<typeof pollPRReviewsForRepo>[3];
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			// Both listReviews calls failed
+			expect(result.errors).toBe(2);
+			expect(result.total).toBe(0);
+			expect(result.emitted).toBe(0);
+
+			// Watermark should NOT be updated because errors > 0 (even though allReviews is empty)
+			expect(mockInsert).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('stale PR optimization', () => {
+		it('skips listReviews for PRs not updated since watermark', async () => {
+			const watermarkDate = new Date('2024-06-01T12:00:00Z');
+			mockFindFirst.mockResolvedValueOnce({ watermark: watermarkDate });
+
+			// PR 41 was updated BEFORE watermark - should be skipped
+			const stalePR = createMockPR({
+				number: 41,
+				updated_at: '2024-05-15T10:00:00Z',
+			});
+			// PR 42 was updated AFTER watermark - should be checked
+			const recentPR = createMockPR({
+				number: 42,
+				updated_at: '2024-06-15T10:00:00Z',
+			});
+
+			const reviewsMap = new Map([
+				[41, [createMockReview({ id: 100, submitted_at: '2024-06-02T10:00:00Z' })]],
+				[42, [createMockReview({ id: 101, submitted_at: '2024-06-15T10:00:00Z' })]],
+			]);
+
+			const octokit = createMockOctokit([stalePR, recentPR], reviewsMap);
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			// listReviews should only be called for PR 42 (recent), not PR 41 (stale)
+			expect(octokit.pulls.listReviews).toHaveBeenCalledTimes(1);
+			expect(octokit.pulls.listReviews).toHaveBeenCalledWith(
+				expect.objectContaining({ pull_number: 42 }),
+			);
+
+			expect(result.total).toBe(1);
+			expect(result.emitted).toBe(1);
+		});
+	});
+
+	describe('PENDING reviews', () => {
+		it('skips PENDING reviews', async () => {
+			const pendingReview = createMockReview({
+				id: 100,
+				state: 'PENDING',
+				submitted_at: new Date(Date.now() + 60000).toISOString(),
+			});
+
+			const reviewsMap = new Map([[42, [pendingReview]]]);
+			const octokit = createMockOctokit([createMockPR({ number: 42 })], reviewsMap);
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			expect(result.total).toBe(0);
+			expect(dispatchAndRecord).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('open PR fetch failure', () => {
+		it('returns errors >= 1 and empty openPRs when list fetch fails', async () => {
+			const octokit = {
+				pulls: {
+					list: vi.fn().mockRejectedValue(new Error('GitHub API error')),
+					listReviews: vi.fn(),
+				},
+			} as unknown as Parameters<typeof pollPRReviewsForRepo>[3];
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			expect(result.errors).toBeGreaterThanOrEqual(1);
+			expect(result.openPRs).toEqual([]);
+		});
+	});
+
+	describe('openPRs draft field mapping', () => {
+		it('maps draft: true from API response to openPRs item', async () => {
+			const draftPR = createMockPR({ number: 42, draft: true });
+			const octokit = createMockOctokit([draftPR], new Map());
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			expect(result.openPRs).toHaveLength(1);
+			expect(result.openPRs[0].draft).toBe(true);
+		});
+
+		it('defaults draft to false when undefined in API response', async () => {
+			// API response without draft field
+			const prWithoutDraft = createMockPR({ number: 42 });
+			expect('draft' in prWithoutDraft).toBe(false);
+
+			const octokit = createMockOctokit([prWithoutDraft], new Map());
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			expect(result.openPRs).toHaveLength(1);
+			expect(result.openPRs[0].draft).toBe(false);
+		});
+
+		it('returns openPRs even when no reviews are found', async () => {
+			const pr = createMockPR({ number: 42 });
+			const octokit = createMockOctokit([pr], new Map());
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			expect(result.openPRs).toHaveLength(1);
+			expect(result.openPRs[0].number).toBe(42);
+		});
+	});
+
+	describe('watermark overlap race condition fix', () => {
+		it('sets watermark to cycleStart minus overlap, not cycle end time', async () => {
+			// This test verifies the fix for the race condition where a review
+			// submitted mid-cycle could be missed if watermark advances to cycle end.
+			const pr = createMockPR({ number: 42 });
+			const octokit = createMockOctokit([pr], new Map());
+
+			// Capture watermark value that gets written
+			let capturedWatermark: Date | undefined;
+			mockValues.mockImplementation((values: { watermark: Date }) => {
+				capturedWatermark = values.watermark;
+				return { onConflictDoUpdate: mockOnConflictDoUpdate };
+			});
+
+			const beforeCall = new Date();
+			await pollPRReviewsForRepo('p1', 'owner', 'repo', octokit, mockAdapter, mockTriggerRegistry);
+
+			expect(mockInsert).toHaveBeenCalled();
+			expect(capturedWatermark).toBeDefined();
+
+			// Watermark should be cycleStart - 5000ms (WATERMARK_OVERLAP_MS)
+			// It should be BEFORE beforeCall (not at or after cycle end)
+			// With the fix: watermark = cycleStart - 5000ms
+			// cycleStart is captured at start of function, so watermark < beforeCall
+			const watermarkTime = capturedWatermark?.getTime() ?? 0;
+			const beforeCallTime = beforeCall.getTime();
+
+			// The watermark should be approximately 5 seconds before the cycle started
+			// Allow some tolerance for test execution time
+			expect(watermarkTime).toBeLessThan(beforeCallTime);
+			expect(beforeCallTime - watermarkTime).toBeGreaterThanOrEqual(4900); // ~5s overlap minus tolerance
+			expect(beforeCallTime - watermarkTime).toBeLessThan(10000); // sanity check
+		});
+
+		it('review submitted mid-cycle is picked up next cycle due to overlap window', async () => {
+			// Scenario: Cycle 1 starts, PR list fetched, review submitted, cycle ends
+			// With OLD code: watermark = cycle end time, review missed
+			// With FIX: watermark = cycleStart - overlap, review picked up in cycle 2
+
+			const cycleStartTime = new Date('2024-06-01T12:00:00.000Z');
+			const reviewSubmittedMidCycle = new Date('2024-06-01T12:00:05.000Z'); // 5s into cycle
+
+			// Set up watermark from "previous cycle" (cycle 1's result)
+			// With the fix, watermark = cycleStart - 5000ms = 11:59:55
+			const watermarkWithFix = new Date(cycleStartTime.getTime() - 5000);
+			mockFindFirst.mockResolvedValueOnce({ watermark: watermarkWithFix });
+
+			// PR was updated when review was submitted
+			const pr = createMockPR({
+				number: 42,
+				updated_at: reviewSubmittedMidCycle.toISOString(),
+			});
+
+			// Review submitted mid-cycle
+			const review = createMockReview({
+				id: 100,
+				submitted_at: reviewSubmittedMidCycle.toISOString(),
+			});
+
+			const reviewsMap = new Map([[42, [review]]]);
+			const octokit = createMockOctokit([pr], reviewsMap);
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			// With the fix, the review should be picked up because:
+			// watermark (11:59:55) < review submitted_at (12:00:05)
+			expect(result.total).toBe(1);
+			expect(result.emitted).toBe(1);
+			expect(dispatchAndRecord).toHaveBeenCalledTimes(1);
+		});
+
+		it('re-seen review in overlap window is not dispatched twice (ledger dedup)', async () => {
+			// The overlap window intentionally re-scans some reviews.
+			// The ledger must prevent duplicate dispatch.
+
+			const review = createMockReview({
+				id: 100,
+				submitted_at: new Date(Date.now() + 60000).toISOString(),
+			});
+
+			const reviewsMap = new Map([[42, [review]]]);
+			const octokit = createMockOctokit([createMockPR({ number: 42 })], reviewsMap);
+
+			// First call: review is new, should be dispatched
+			const result1 = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			expect(result1.emitted).toBe(1);
+			expect(dispatchAndRecord).toHaveBeenCalledTimes(1);
+
+			// Second call: review is in ledger, should be skipped
+			vi.mocked(batchCheckLedger).mockResolvedValueOnce(
+				new Set(['github:owner/repo:pr_review:42:100']),
+			);
+
+			const result2 = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			expect(result2.total).toBe(1);
+			expect(result2.skipped).toBe(1);
+			expect(result2.emitted).toBe(0);
+			// dispatchAndRecord should not be called again
+			expect(dispatchAndRecord).toHaveBeenCalledTimes(1);
+		});
+
+		it('cold start uses 1-hour lookback, not overlap', async () => {
+			// When no watermark exists (cold start), use 1 hour lookback
+			mockFindFirst.mockResolvedValueOnce(undefined); // No watermark
+
+			const recentReview = createMockReview({
+				id: 100,
+				submitted_at: new Date(Date.now() - 30 * 60 * 1000).toISOString(), // 30 min ago
+			});
+			const oldReview = createMockReview({
+				id: 101,
+				submitted_at: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(), // 2 hours ago
+			});
+
+			const reviewsMap = new Map([[42, [recentReview, oldReview]]]);
+			const octokit = createMockOctokit([createMockPR({ number: 42 })], reviewsMap);
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			// Only the recent review should be picked up (within 1 hour)
+			expect(result.total).toBe(1);
+			expect(result.emitted).toBe(1);
+		});
+
+		it('no-open-PRs path still advances watermark with overlap', async () => {
+			const octokit = createMockOctokit([], new Map()); // No open PRs
+
+			let capturedWatermark: Date | undefined;
+			mockValues.mockImplementation((values: { watermark: Date }) => {
+				capturedWatermark = values.watermark;
+				return { onConflictDoUpdate: mockOnConflictDoUpdate };
+			});
+
+			const beforeCall = new Date();
+			await pollPRReviewsForRepo('p1', 'owner', 'repo', octokit, mockAdapter, mockTriggerRegistry);
+
+			expect(mockInsert).toHaveBeenCalled();
+			expect(capturedWatermark).toBeDefined();
+
+			// Watermark should be cycleStart - overlap, not "now"
+			const watermarkTime = capturedWatermark?.getTime() ?? 0;
+			expect(watermarkTime).toBeLessThan(beforeCall.getTime());
+		});
+
+		it('errors > 0 prevents watermark advance', async () => {
+			// This test confirms the existing behavior is preserved
+			const pr = createMockPR({ number: 42 });
+
+			const octokit = {
+				pulls: {
+					list: vi.fn().mockResolvedValue({ data: [pr] }),
+					listReviews: vi.fn().mockRejectedValue(new Error('API error')),
+				},
+			} as unknown as Parameters<typeof pollPRReviewsForRepo>[3];
+
+			const result = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			expect(result.errors).toBe(1);
+			expect(mockInsert).not.toHaveBeenCalled(); // Watermark NOT updated
+		});
+
+		it('pr_review event contains fields needed for pr-ready-to-merge trigger', async () => {
+			// The pr-ready-to-merge trigger needs: action, review.state, review.user.login
+			const review = createMockReview({
+				id: 100,
+				state: 'APPROVED',
+				submitted_at: new Date(Date.now() + 60000).toISOString(),
+				user: { login: 'reviewer-user' },
+			});
+
+			const reviewsMap = new Map([[42, [review]]]);
+			const octokit = createMockOctokit([createMockPR({ number: 42 })], reviewsMap);
+
+			await pollPRReviewsForRepo('p1', 'owner', 'repo', octokit, mockAdapter, mockTriggerRegistry);
+
+			expect(dispatchAndRecord).toHaveBeenCalledWith(
+				'p1',
+				'github',
+				'pr_review',
+				expect.any(String),
+				expect.objectContaining({
+					action: 'submitted',
+					review: expect.objectContaining({
+						state: 'approved', // lowercase as per GitHub webhook format
+						user: { login: 'reviewer-user' },
+					}),
+				}),
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+		});
+	});
+
+	describe('race condition scenarios (two-cycle simulation)', () => {
+		/**
+		 * These tests simulate two consecutive polling cycles to verify that
+		 * events occurring mid-cycle are not missed due to watermark timing.
+		 *
+		 * The watermark overlap fix ensures:
+		 * - Watermark is set to cycleStart - OVERLAP_MS (not cycle end)
+		 * - Events submitted during cycle execution are picked up next cycle
+		 * - Ledger deduplication prevents double dispatch
+		 */
+
+		it('two-cycle race: review submitted after PR list fetch is picked up next cycle', async () => {
+			// Use fake timers to control time precisely
+			vi.useFakeTimers();
+
+			// In-memory watermark storage to persist between cycles
+			const watermarkStorage = new Map<string, Date>();
+
+			// Cycle 1 starts at T=0
+			const T0 = new Date('2024-06-01T12:00:00.000Z');
+			vi.setSystemTime(T0);
+
+			// Mock watermark get/set to use in-memory storage
+			mockFindFirst.mockImplementation(() => {
+				const stored = watermarkStorage.get('owner/repo');
+				return stored ? { watermark: stored } : undefined;
+			});
+			mockValues.mockImplementation((values: { watermark: Date; resourceId: string }) => {
+				watermarkStorage.set(values.resourceId, values.watermark);
+				return { onConflictDoUpdate: mockOnConflictDoUpdate };
+			});
+
+			// Track ledger entries to simulate dedup
+			const ledgerEntries = new Set<string>();
+			vi.mocked(batchCheckLedger).mockImplementation(async (_projectId, _provider, keys) => {
+				const existing = new Set<string>();
+				for (const key of keys) {
+					if (ledgerEntries.has(key)) {
+						existing.add(key);
+					}
+				}
+				return existing;
+			});
+			vi.mocked(dispatchAndRecord).mockImplementation(
+				async (_projectId, _provider, _eventType, dedupKey) => {
+					ledgerEntries.add(dedupKey);
+					return { recorded: true, deferred: false, skipped: false, enqueued: true };
+				},
+			);
+
+			// PR #42 updated at T+7s (during cycle 1 execution)
+			const prUpdatedAt = new Date(T0.getTime() + 7000).toISOString();
+
+			// CYCLE 1: PR list returns PR #42, but listReviews returns empty
+			// (review will be submitted at T+8s, after listReviews call)
+			const cycle1Octokit = {
+				pulls: {
+					list: vi.fn().mockResolvedValue({
+						data: [createMockPR({ number: 42, updated_at: prUpdatedAt })],
+					}),
+					listReviews: vi.fn().mockResolvedValue({ data: [] }), // No reviews yet
+				},
+			} as unknown as Parameters<typeof pollPRReviewsForRepo>[3];
+
+			const result1 = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				cycle1Octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			// Cycle 1: no reviews found
+			expect(result1.total).toBe(0);
+			expect(result1.emitted).toBe(0);
+			expect(dispatchAndRecord).not.toHaveBeenCalled();
+
+			// Verify watermark was stored (cycleStart - 5000ms = T0 - 5s)
+			const storedWatermark = watermarkStorage.get('owner/repo');
+			expect(storedWatermark).toBeDefined();
+			expect(storedWatermark?.getTime()).toBe(T0.getTime() - 5000);
+
+			// CYCLE 2: Advance time to T+60s
+			const T60 = new Date(T0.getTime() + 60000);
+			vi.setSystemTime(T60);
+
+			// Review was submitted at T+8s (after cycle 1's listReviews call)
+			const reviewSubmittedAt = new Date(T0.getTime() + 8000).toISOString();
+
+			// Cycle 2: PR #42 now has the review visible
+			const cycle2Octokit = {
+				pulls: {
+					list: vi.fn().mockResolvedValue({
+						data: [createMockPR({ number: 42, updated_at: reviewSubmittedAt })],
+					}),
+					listReviews: vi.fn().mockResolvedValue({
+						data: [
+							createMockReview({
+								id: 200,
+								submitted_at: reviewSubmittedAt,
+								user: { login: 'late-reviewer' },
+							}),
+						],
+					}),
+				},
+			} as unknown as Parameters<typeof pollPRReviewsForRepo>[3];
+
+			const result2 = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				cycle2Octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			// Cycle 2: the review should be picked up
+			// - Watermark from cycle 1: T0 - 5s
+			// - Review submitted_at: T0 + 8s
+			// - T0 + 8s > T0 - 5s, so review passes watermark filter
+			expect(result2.total).toBe(1);
+			expect(result2.emitted).toBe(1);
+			expect(dispatchAndRecord).toHaveBeenCalledTimes(1);
+			expect(dispatchAndRecord).toHaveBeenCalledWith(
+				'p1',
+				'github',
+				'pr_review',
+				'github:owner/repo:pr_review:42:200',
+				expect.objectContaining({
+					review: expect.objectContaining({
+						user: { login: 'late-reviewer' },
+					}),
+				}),
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			vi.useRealTimers();
+		});
+
+		it('Path C race: review on PR B submitted before PR A review but missed in cycle 1', async () => {
+			// This tests the scenario where multiple PRs are polled in sequence,
+			// and a review on PR B is submitted while PR A's reviews are being fetched.
+			vi.useFakeTimers();
+
+			const watermarkStorage = new Map<string, Date>();
+			const ledgerEntries = new Set<string>();
+
+			const T0 = new Date('2024-06-01T12:00:00.000Z');
+			vi.setSystemTime(T0);
+
+			mockFindFirst.mockImplementation(() => {
+				const stored = watermarkStorage.get('owner/repo');
+				return stored ? { watermark: stored } : undefined;
+			});
+			mockValues.mockImplementation((values: { watermark: Date; resourceId: string }) => {
+				watermarkStorage.set(values.resourceId, values.watermark);
+				return { onConflictDoUpdate: mockOnConflictDoUpdate };
+			});
+			vi.mocked(batchCheckLedger).mockImplementation(async (_projectId, _provider, keys) => {
+				const existing = new Set<string>();
+				for (const key of keys) {
+					if (ledgerEntries.has(key)) {
+						existing.add(key);
+					}
+				}
+				return existing;
+			});
+			vi.mocked(dispatchAndRecord).mockImplementation(
+				async (_projectId, _provider, _eventType, dedupKey) => {
+					ledgerEntries.add(dedupKey);
+					return { recorded: true, deferred: false, skipped: false, enqueued: true };
+				},
+			);
+
+			// PR A and PR B both updated recently
+			const prAUpdatedAt = new Date(T0.getTime() + 5000).toISOString(); // T+5s
+			const prBUpdatedAt = new Date(T0.getTime() + 4000).toISOString(); // T+4s
+
+			// Review timestamps
+			const reviewASubmittedAt = new Date(T0.getTime() + 5000).toISOString(); // T+5s - fetched in cycle 1
+			const reviewBSubmittedAt = new Date(T0.getTime() + 4000).toISOString(); // T+4s - missed in cycle 1
+
+			// CYCLE 1: Both PRs in list
+			// - PR A's review (T+5s) is fetched and dispatched
+			// - PR B's review (T+4s) is NOT returned by listReviews (API timing issue)
+			const cycle1Octokit = {
+				pulls: {
+					list: vi.fn().mockResolvedValue({
+						data: [
+							createMockPR({ number: 41, updated_at: prAUpdatedAt }),
+							createMockPR({ number: 42, updated_at: prBUpdatedAt }),
+						],
+					}),
+					listReviews: vi.fn().mockImplementation(({ pull_number }: { pull_number: number }) => {
+						if (pull_number === 41) {
+							// PR A has its review
+							return Promise.resolve({
+								data: [
+									createMockReview({
+										id: 100,
+										submitted_at: reviewASubmittedAt,
+										user: { login: 'reviewer-a' },
+									}),
+								],
+							});
+						}
+						// PR B: review was submitted but API returns empty (timing issue)
+						return Promise.resolve({ data: [] });
+					}),
+				},
+			} as unknown as Parameters<typeof pollPRReviewsForRepo>[3];
+
+			const result1 = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				cycle1Octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			// Cycle 1: Only PR A's review found and dispatched
+			expect(result1.total).toBe(1);
+			expect(result1.emitted).toBe(1);
+			expect(dispatchAndRecord).toHaveBeenCalledTimes(1);
+			expect(dispatchAndRecord).toHaveBeenCalledWith(
+				'p1',
+				'github',
+				'pr_review',
+				'github:owner/repo:pr_review:41:100',
+				expect.any(Object),
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			// CYCLE 2: Advance time
+			const T60 = new Date(T0.getTime() + 60000);
+			vi.setSystemTime(T60);
+
+			vi.mocked(dispatchAndRecord).mockClear();
+
+			// Cycle 2: PR B's review is now visible
+			const cycle2Octokit = {
+				pulls: {
+					list: vi.fn().mockResolvedValue({
+						data: [
+							createMockPR({ number: 41, updated_at: prAUpdatedAt }),
+							createMockPR({ number: 42, updated_at: prBUpdatedAt }),
+						],
+					}),
+					listReviews: vi.fn().mockImplementation(({ pull_number }: { pull_number: number }) => {
+						if (pull_number === 41) {
+							// PR A's review still there (will be skipped by ledger)
+							return Promise.resolve({
+								data: [
+									createMockReview({
+										id: 100,
+										submitted_at: reviewASubmittedAt,
+										user: { login: 'reviewer-a' },
+									}),
+								],
+							});
+						}
+						// PR B's review now visible
+						return Promise.resolve({
+							data: [
+								createMockReview({
+									id: 101,
+									submitted_at: reviewBSubmittedAt,
+									user: { login: 'reviewer-b' },
+								}),
+							],
+						});
+					}),
+				},
+			} as unknown as Parameters<typeof pollPRReviewsForRepo>[3];
+
+			const result2 = await pollPRReviewsForRepo(
+				'p1',
+				'owner',
+				'repo',
+				cycle2Octokit,
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			// Cycle 2: PR A's review skipped (in ledger), PR B's review dispatched
+			// - Watermark from cycle 1: T0 - 5s
+			// - PR B review submitted_at: T0 + 4s
+			// - T0 + 4s > T0 - 5s, so it passes watermark filter
+			expect(result2.total).toBe(2);
+			expect(result2.skipped).toBe(1); // PR A's review skipped by ledger
+			expect(result2.emitted).toBe(1); // PR B's review dispatched
+			expect(dispatchAndRecord).toHaveBeenCalledTimes(1);
+			expect(dispatchAndRecord).toHaveBeenCalledWith(
+				'p1',
+				'github',
+				'pr_review',
+				'github:owner/repo:pr_review:42:101',
+				expect.objectContaining({
+					review: expect.objectContaining({
+						user: { login: 'reviewer-b' },
+					}),
+				}),
+				mockAdapter,
+				mockTriggerRegistry,
+			);
+
+			vi.useRealTimers();
+		});
+	});
+});

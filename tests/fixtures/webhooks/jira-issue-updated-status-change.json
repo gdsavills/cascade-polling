@@ -1,0 +1,66 @@
+{
+  "_source": "https://developer.atlassian.com/cloud/jira/platform/webhooks/#webhook-payload-for-issue-events",
+  "_note": "Minimal webhook payload structure based on Jira Cloud API docs for jira:issue_updated with status change",
+  "timestamp": 1525698237764,
+  "webhookEvent": "jira:issue_updated",
+  "issue_event_type_name": "issue_generic",
+  "user": {
+    "self": "https://your-domain.atlassian.net/rest/api/3/user?accountId=5b10a2844c20165700ede21g",
+    "accountId": "5b10a2844c20165700ede21g",
+    "accountType": "atlassian",
+    "emailAddress": "example@example.com",
+    "displayName": "Example User"
+  },
+  "issue": {
+    "id": "10000",
+    "self": "https://your-domain.atlassian.net/rest/api/3/issue/10000",
+    "key": "PROJ-123",
+    "fields": {
+      "summary": "Test Issue Summary",
+      "status": {
+        "self": "https://your-domain.atlassian.net/rest/api/3/status/10002",
+        "description": "",
+        "iconUrl": "https://your-domain.atlassian.net/",
+        "name": "In Progress",
+        "id": "10002",
+        "statusCategory": {
+          "self": "https://your-domain.atlassian.net/rest/api/3/statuscategory/4",
+          "id": 4,
+          "key": "indeterminate",
+          "colorName": "yellow",
+          "name": "In Progress"
+        }
+      },
+      "project": {
+        "self": "https://your-domain.atlassian.net/rest/api/3/project/10000",
+        "id": "10000",
+        "key": "PROJ",
+        "name": "Project Name"
+      },
+      "labels": ["feature", "priority-high"],
+      "components": [
+        {
+          "self": "https://your-domain.atlassian.net/rest/api/3/component/10000",
+          "id": "10000",
+          "name": "Backend"
+        }
+      ],
+      "created": "2019-05-15T15:20:33.000+0000",
+      "updated": "2019-05-15T15:20:53.000+0000"
+    }
+  },
+  "changelog": {
+    "id": "10001",
+    "items": [
+      {
+        "field": "status",
+        "fieldtype": "jira",
+        "fieldId": "status",
+        "from": "10001",
+        "fromString": "To Do",
+        "to": "10002",
+        "toString": "In Progress"
+      }
+    ]
+  }
+}
