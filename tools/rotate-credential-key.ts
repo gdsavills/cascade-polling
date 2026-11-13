@@ -15,7 +15,7 @@ import { createCipheriv, randomBytes } from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { closeDb, getDb } from '../src/db/client.js';
 import { decryptCredential, isEncryptedValue, isEncryptionEnabled } from '../src/db/crypto.js';
-import { projectCredentials } from '../src/db/schema/index.js';
+import { projectCredentials, projectSubscriptions } from '../src/db/schema/index.js';
 
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 12;
@@ -31,6 +31,36 @@ function encryptWithKey(plaintext: string, aad: string, keyHex: string): string 
 	const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
 	const authTag = cipher.getAuthTag();
 	return `${PREFIX}${iv.toString('hex')}:${authTag.toString('hex')}:${encrypted.toString('hex')}`;
+}
+
+/** Claude subscription tokens use the same AAD (projectId) as project credentials. */
+async function rotateSubscriptionTokens(newKeyHex: string, dryRun: boolean): Promise<number> {
+	const db = getDb();
+	const allSubs = await db
+		.select({
+			id: projectSubscriptions.id,
+			projectId: projectSubscriptions.projectId,
+			value: projectSubscriptions.value,
+		})
+		.from(projectSubscriptions);
+
+	for (const sub of allSubs) {
+		const plaintext = isEncryptedValue(sub.value)
+			? decryptCredential(sub.value, sub.projectId)
+			: sub.value;
+		const reEncrypted = encryptWithKey(plaintext, sub.projectId, newKeyHex);
+
+		if (dryRun) {
+			console.log(`  subscription #${sub.id}: would re-encrypt`);
+		} else {
+			await db
+				.update(projectSubscriptions)
+				.set({ value: reEncrypted, updatedAt: new Date() })
+				.where(eq(projectSubscriptions.id, sub.id));
+			console.log(`  subscription #${sub.id}: re-encrypted`);
+		}
+	}
+	return allSubs.length;
 }
 
 async function main() {
@@ -86,7 +116,12 @@ async function main() {
 		rotated++;
 	}
 
-	console.log(`\n${dryRun ? '[DRY RUN] ' : ''}Done: ${rotated} rotated, ${allCreds.length} total`);
+	const subsRotated = await rotateSubscriptionTokens(newKeyHex, dryRun);
+	rotated += subsRotated;
+
+	console.log(
+		`\n${dryRun ? '[DRY RUN] ' : ''}Done: ${rotated} rotated, ${allCreds.length + subsRotated} total`,
+	);
 	if (!dryRun) {
 		console.log(
 			'\nIMPORTANT: Update CREDENTIAL_MASTER_KEY to the new key value and restart CASCADE.',
