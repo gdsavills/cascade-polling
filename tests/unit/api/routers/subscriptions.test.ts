@@ -104,6 +104,40 @@ describe('subscriptionsRouter', () => {
 			);
 			expect(mockCreate).not.toHaveBeenCalled();
 		});
+
+		it('rejects a whitespace-only name or token and trims the rest', async () => {
+			await expectTRPCError(
+				authed().create({ projectId: 'proj-1', name: '   ', token: 'tok' }),
+				'BAD_REQUEST',
+			);
+			await expectTRPCError(
+				authed().create({ projectId: 'proj-1', name: 'S', token: '  ' }),
+				'BAD_REQUEST',
+			);
+			expect(mockCreate).not.toHaveBeenCalled();
+			mockCreate.mockResolvedValue(6);
+			await authed().create({ projectId: 'proj-1', name: '  S  ', token: ' tok ' });
+			expect(mockCreate).toHaveBeenCalledWith('proj-1', 'S', 'tok');
+		});
+
+		it('maps a duplicate name to CONFLICT', async () => {
+			const pgErr = Object.assign(new Error('duplicate key'), {
+				code: '23505',
+				constraint: 'uq_project_subscriptions_project_name',
+			});
+			mockCreate.mockRejectedValue(Object.assign(new Error('Failed query'), { cause: pgErr }));
+			await expectTRPCError(
+				authed().create({ projectId: 'proj-1', name: 'S', token: 'tok' }),
+				'CONFLICT',
+			);
+		});
+
+		it('rethrows other database errors', async () => {
+			mockCreate.mockRejectedValue(new Error('boom'));
+			await expect(
+				authed().create({ projectId: 'proj-1', name: 'S', token: 'tok' }),
+			).rejects.toThrow('boom');
+		});
 	});
 
 	describe('setEnabled / delete', () => {

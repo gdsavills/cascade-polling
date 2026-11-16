@@ -9,7 +9,7 @@ import {
 } from 'drizzle-orm/pg-core';
 import { projects } from './projects.js';
 
-// The partial index idx_project_subscriptions_project_enabled lives only in migration 0062.
+// The partial index idx_project_subscriptions_project_enabled lives only in migration 0063.
 export const projectSubscriptions = pgTable(
 	'project_subscriptions',
 	{

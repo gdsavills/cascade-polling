@@ -144,7 +144,7 @@ export function ProjectClaudeSubscriptions({ projectId }: { projectId: string })
 						/>
 						<button
 							type="submit"
-							disabled={!name || !token || createMutation.isPending}
+							disabled={!name.trim() || !token.trim() || createMutation.isPending}
 							className="inline-flex h-9 items-center rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50 shrink-0"
 						>
 							{createMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Add'}

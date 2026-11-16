@@ -64,6 +64,16 @@ describe('subscriptionsRepository (integration)', () => {
 			await deleteSubscription(id);
 			expect(await listSubscriptions('test-project')).toEqual([]);
 		});
+
+		it('rejects a duplicate name with the unique constraint on the error cause', async () => {
+			// The subscriptions tRPC router matches this shape to return CONFLICT.
+			await createSubscription('test-project', 'Sub A', 'tok-a');
+			const err = await createSubscription('test-project', 'Sub A', 'tok-b').catch((e) => e);
+			expect(err?.cause).toMatchObject({
+				code: '23505',
+				constraint: 'uq_project_subscriptions_project_name',
+			});
+		});
 	});
 
 	describe('selectBestSubscription', () => {

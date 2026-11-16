@@ -10,6 +10,22 @@ import {
 import { protectedProcedure, router } from '../trpc.js';
 import { verifyProjectOrgAccess } from './_shared/projectAccess.js';
 
+/**
+ * drizzle wraps the pg error, so `code`/`constraint` sit on `.cause`; walk the
+ * chain like `rethrowRepoPrimaryConflict` in projects.ts does.
+ */
+function isDuplicateNameError(err: unknown): boolean {
+	let current: unknown = err;
+	for (let depth = 0; depth < 5 && current != null; depth++) {
+		const c = current as { code?: unknown; constraint?: unknown };
+		if (c.code === '23505' && c.constraint === 'uq_project_subscriptions_project_name') {
+			return true;
+		}
+		current = (current as { cause?: unknown }).cause;
+	}
+	return false;
+}
+
 async function authorizeSubscription(id: number, orgId: string): Promise<void> {
 	const projectId = await getSubscriptionProjectId(id);
 	if (!projectId) throw new TRPCError({ code: 'NOT_FOUND' });
@@ -37,13 +53,23 @@ export const subscriptionsRouter = router({
 		.input(
 			z.object({
 				projectId: z.string(),
-				name: z.string().min(1).max(50),
-				token: z.string().min(1),
+				name: z.string().trim().min(1).max(50),
+				token: z.string().trim().min(1),
 			}),
 		)
 		.mutation(async ({ ctx, input }) => {
 			await verifyProjectOrgAccess(input.projectId, ctx.effectiveOrgId);
-			return { id: await createSubscription(input.projectId, input.name, input.token) };
+			try {
+				return { id: await createSubscription(input.projectId, input.name, input.token) };
+			} catch (err) {
+				if (isDuplicateNameError(err)) {
+					throw new TRPCError({
+						code: 'CONFLICT',
+						message: `A subscription named "${input.name}" already exists in this project.`,
+					});
+				}
+				throw err;
+			}
 		}),
 
 	setEnabled: protectedProcedure
